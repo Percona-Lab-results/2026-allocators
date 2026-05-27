@@ -39,13 +39,14 @@ sleep 2
 
 # Check command line arguments
 if [ $# -lt 3 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp_enabled:yes|no> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc>"
+    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> [skip_init:skip|noskip]"
     exit 1
 fi
 
 SERVER_BINARY="$1"
 THP_ENABLED="$2"
 ALLOCATOR="$3"
+SKIP_INIT="${4:-noskip}"  # Default to "noskip" if not provided
 
 # Validate inputs
 if [ ! -f "${SERVER_BINARY}" ]; then
@@ -53,13 +54,18 @@ if [ ! -f "${SERVER_BINARY}" ]; then
     exit 1
 fi
 
-if [[ ! "${THP_ENABLED}" =~ ^(yes|no)$ ]]; then
-    log_error "THP parameter must be 'yes' or 'no', got: ${THP_ENABLED}"
+if [[ ! "${THP_ENABLED}" =~ ^(thp|nothp)$ ]]; then
+    log_error "THP parameter must be 'thp' or 'nothp', got: ${THP_ENABLED}"
     exit 1
 fi
 
 if [[ ! "${ALLOCATOR}" =~ ^(jemalloc36|jemalloc53|tcmalloc|glibc)$ ]]; then
     log_error "Allocator must be one of: jemalloc36, jemalloc53, tcmalloc, glibc"
+    exit 1
+fi
+
+if [[ ! "${SKIP_INIT}" =~ ^(skip|noskip)$ ]]; then
+    log_error "Skip init parameter must be 'skip' or 'noskip', got: ${SKIP_INIT}"
     exit 1
 fi
 
@@ -189,7 +195,7 @@ sed -i "s|PID_FILE_PLACEHOLDER|${SERVER_DATA_DIR}/mysql.pid|g" "${MY_CNF}"
 sed -i "s|SOCKET_PLACEHOLDER|${MYSQL_SOCKET}|g" "${MY_CNF}"
 
 # 5.1. Add large-pages=ON if THP is enabled
-if [ "${THP_ENABLED}" = "yes" ]; then
+if [ "${THP_ENABLED}" = "thp" ]; then
     log_info "Transparent Huge Pages enabled - adding large-pages=ON to my.cnf"
     sed -i '/innodb_buffer_pool_instances = 16/a\\n# Transparent Huge Pages\nlarge-pages = ON' "${MY_CNF}"
 fi
@@ -197,24 +203,29 @@ fi
 log_info "Configuration file created successfully"
 
 # 4. Remove old server data directory and create fresh one
-if [ -d "${SERVER_DATA_DIR}" ]; then
-   log_info "Removing old server data directory: ${SERVER_DATA_DIR}"
-   rm -rf "${SERVER_DATA_DIR}"
+if [ "${SKIP_INIT}" = "noskip" ]; then
+    if [ -d "${SERVER_DATA_DIR}" ]; then
+       log_info "Removing old server data directory: ${SERVER_DATA_DIR}"
+       rm -rf "${SERVER_DATA_DIR}"
+    fi
+
+    log_info "Creating fresh server data directory: ${SERVER_DATA_DIR}"
+    mkdir -p "${SERVER_DATA_DIR}"
+
+    # Initialize data directory
+    log_info "Initializing MySQL data directory..."
+    "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
+     --innodb_flush_log_at_trx_commit=0 \
+     --innodb_doublewrite=0 \
+     --sync_binlog=0 \
+     --innodb_buffer_pool_size=1G
+else
+    log_info "Skipping initialization - using existing data directory: ${SERVER_DATA_DIR}"
+    if [ ! -d "${SERVER_DATA_DIR}" ]; then
+        log_error "Data directory does not exist: ${SERVER_DATA_DIR}"
+        exit 1
+    fi
 fi
-
-log_info "Creating fresh server data directory: ${SERVER_DATA_DIR}"
-mkdir -p "${SERVER_DATA_DIR}"
-
-# Initialize data directory
-log_info "Initializing MySQL data directory..."
-"${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
- --innodb_flush_log_at_trx_commit=0 \
- --innodb_doublewrite=0 \
- --sync_binlog=0 \
- --innodb_buffer_pool_size=1G
-
-# Ensure data directory exists (when skipping initialization)
-#mkdir -p "${SERVER_DATA_DIR}"
 
 # Set LD_PRELOAD for jemalloc36 if specified
 if [ "${ALLOCATOR}" = "jemalloc36" ]; then
@@ -372,18 +383,20 @@ if ! check_allocator ${MYSQLD_PID} "${ALLOCATOR}"; then
 fi
 
 # 7. Build the database using hammerdb_load.tcl
-log_info "Building TPC-C database schema using HammerDB..."
-log_info "This may take a while..."
+if [ "${SKIP_INIT}" = "noskip" ]; then
+    log_info "Building TPC-C database schema using HammerDB..."
+    log_info "This may take a while..."
 
-"${HAMMERDB_CLI}" auto "${HAMMERDB_LOAD_TCL}" || {
-   log_error "Database build failed"
-   kill ${MYSQLD_PID} 2>/dev/null || true
-   exit 1
-}
+    "${HAMMERDB_CLI}" auto "${HAMMERDB_LOAD_TCL}" || {
+       log_error "Database build failed"
+       kill ${MYSQLD_PID} 2>/dev/null || true
+       exit 1
+    }
 
-log_info "Database build completed successfully"
-
-log_info "Skipping database build - using existing database"
+    log_info "Database build completed successfully"
+else
+    log_info "Skipping database build - using existing database"
+fi
 
 # Create results directory
 mkdir -p "${RESULTS_DIR}"
