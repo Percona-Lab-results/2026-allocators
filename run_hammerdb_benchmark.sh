@@ -10,6 +10,7 @@ RESULTS_DIR="${SCRIPT_DIR}/results"
 SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
+MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
 BENCHMARK_DURATION_HOURS=20
 VIRTUAL_USERS=80
 
@@ -30,6 +31,11 @@ log_error() {
 log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
+
+# Kill any existing mysqld processes
+log_info "Killing any existing mysqld processes..."
+sudo killall mysqld 2>/dev/null || true
+sleep 2
 
 # Check command line arguments
 if [ $# -lt 3 ]; then
@@ -69,8 +75,8 @@ else
     # Not in current directory, try to download
     log_info "HammerDB not found in current directory, downloading..."
 
-    HAMMERDB_URL="https://github.com/TPC-Council/HammerDB/releases/download/v5.0/HammerDB-5.0-Prod-Lin-UBU24.tar.gz"
-    HAMMERDB_TARBALL="${SCRIPT_DIR}/HammerDB-5.0-Prod-Lin-UBU24.tar.gz"
+    HAMMERDB_URL="https://github.com/TPC-Council/HammerDB/releases/download/v5.0/HammerDB-5.0-Prod-Lin-UBU22.tar.gz"
+    HAMMERDB_TARBALL="${SCRIPT_DIR}/HammerDB-5.0-Prod-Lin-UBU22.tar.gz"
 
     # Download HammerDB
     if ! command -v wget &> /dev/null && ! command -v curl &> /dev/null; then
@@ -162,17 +168,15 @@ innodb_doublewrite = OFF
 # Table settings
 default-storage-engine = InnoDB
 
-# Network settings
-bind-address = 0.0.0.0
-port = 3306
-
 # Logging
 log-error = ERROR_LOG_PLACEHOLDER
 pid-file = PID_FILE_PLACEHOLDER
 
-# SSL (optional, can be disabled for testing)
-# ssl-ca = /path/to/ca.pem
-# require_secure_transport = OFF
+# Socket
+socket = SOCKET_PLACEHOLDER
+
+# Disable SSL requirement
+require_secure_transport = OFF
 
 # Other settings
 sql_mode = ""
@@ -182,6 +186,7 @@ EOF
 sed -i "s|DATA_DIR_PLACEHOLDER|${SERVER_DATA_DIR}|g" "${MY_CNF}"
 sed -i "s|ERROR_LOG_PLACEHOLDER|${SERVER_DATA_DIR}/mysql-error.log|g" "${MY_CNF}"
 sed -i "s|PID_FILE_PLACEHOLDER|${SERVER_DATA_DIR}/mysql.pid|g" "${MY_CNF}"
+sed -i "s|SOCKET_PLACEHOLDER|${MYSQL_SOCKET}|g" "${MY_CNF}"
 
 # 5.1. Add large-pages=ON if THP is enabled
 if [ "${THP_ENABLED}" = "yes" ]; then
@@ -191,20 +196,30 @@ fi
 
 log_info "Configuration file created successfully"
 
-# 4. Ensure server data directory exists
-if [ ! -d "${SERVER_DATA_DIR}" ]; then
-    log_info "Creating server data directory: ${SERVER_DATA_DIR}"
-    mkdir -p "${SERVER_DATA_DIR}"
-fi
+# 4. Remove old server data directory and create fresh one
+# COMMENTED OUT TO SAVE TIME - UNCOMMENT TO REINITIALIZE
+#if [ -d "${SERVER_DATA_DIR}" ]; then
+#    log_info "Removing old server data directory: ${SERVER_DATA_DIR}"
+#    rm -rf "${SERVER_DATA_DIR}"
+#fi
+#
+#log_info "Creating fresh server data directory: ${SERVER_DATA_DIR}"
+#mkdir -p "${SERVER_DATA_DIR}"
+#
+## Initialize data directory
+#log_info "Initializing MySQL data directory..."
+#"${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
+#  --innodb_flush_log_at_trx_commit=0 \
+#  --innodb_doublewrite=0 \
+#  --sync_binlog=0 \
+#  --innodb_buffer_pool_size=1G
 
-# Initialize data directory if empty
-if [ ! -d "${SERVER_DATA_DIR}/mysql" ]; then
-    log_info "Initializing MySQL data directory..."
-    "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami)
-fi
+# Ensure data directory exists (when skipping initialization)
+#mkdir -p "${SERVER_DATA_DIR}"
 
 # Start MySQL server
 log_info "Starting MySQL server..."
+log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
 "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
 MYSQLD_PID=$!
 
@@ -212,9 +227,8 @@ MYSQLD_PID=$!
 log_info "Waiting for MySQL server to be ready (PID: ${MYSQLD_PID})..."
 sleep 5
 MYSQL_CLIENT=$(dirname "${SERVER_BINARY}")/mysql
-if [ ! -f "${MYSQL_CLIENT}" ]; then
-    MYSQL_CLIENT=$(which mysql 2>/dev/null || echo "")
-fi
+
+log_info "MySQL client path: ${MYSQL_CLIENT}"
 
 if [ -z "${MYSQL_CLIENT}" ]; then
     log_error "MySQL client not found"
@@ -222,18 +236,45 @@ if [ -z "${MYSQL_CLIENT}" ]; then
     exit 1
 fi
 
-for i in {1..30}; do
-    if "${MYSQL_CLIENT}" -u root -e "SELECT 1" &>/dev/null; then
+for i in {1..300}; do
+    log_info "Connecting to mysql client..."
+    set +e
+    CONNECT_OUTPUT=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -e "SELECT 1" 2>&1)
+    MYSQL_EXIT_CODE=$?
+    set -e
+    log_info "OUT=$CONNECT_OUTPUT"
+    if [ $MYSQL_EXIT_CODE -eq 0 ]; then
         log_info "MySQL server is ready"
         break
     fi
-    if [ $i -eq 30 ]; then
-        log_error "MySQL server failed to start"
+    if [ $i -eq 60 ]; then
+        log_error "MySQL server failed to start after 120 seconds"
+        log_error "Last connection error: ${CONNECT_OUTPUT}"
+        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
         kill ${MYSQLD_PID} 2>/dev/null || true
         exit 1
     fi
+    log_warn "Connection attempt $i/60 failed, retrying... (${CONNECT_OUTPUT})"
     sleep 2
 done
+
+# Create MySQL user for HammerDB
+log_info "Creating MySQL user for HammerDB..."
+"${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root <<EOF
+CREATE USER IF NOT EXISTS 'tpcuser'@'%' IDENTIFIED BY 'tpcpass';
+GRANT ALL PRIVILEGES ON *.* TO 'tpcuser'@'%' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS 'tpcuser'@'localhost' IDENTIFIED BY 'tpcpass';
+GRANT ALL PRIVILEGES ON *.* TO 'tpcuser'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+
+if [ $? -eq 0 ]; then
+    log_info "MySQL user 'tpcuser' created successfully with all privileges"
+else
+    log_error "Failed to create MySQL user"
+    kill ${MYSQLD_PID} 2>/dev/null || true
+    exit 1
+fi
 
 # 6. Check allocator
 log_info "Checking allocator: ${ALLOCATOR}"
@@ -314,45 +355,63 @@ if ! check_allocator ${MYSQLD_PID} "${ALLOCATOR}"; then
 fi
 
 # 7. Build the database using hammerdb_load.tcl
-log_info "Building TPC-C database schema using HammerDB..."
-log_info "This may take a while..."
+# COMMENTED OUT TO SAVE TIME - UNCOMMENT TO REBUILD DATABASE
+#log_info "Building TPC-C database schema using HammerDB..."
+#log_info "This may take a while..."
+#
+#"${HAMMERDB_CLI}" auto "${HAMMERDB_LOAD_TCL}" || {
+#    log_error "Database build failed"
+#    kill ${MYSQLD_PID} 2>/dev/null || true
+#    exit 1
+#}
+#
+#log_info "Database build completed successfully"
 
-"${HAMMERDB_CLI}" auto "${HAMMERDB_LOAD_TCL}" || {
-    log_error "Database build failed"
-    kill ${MYSQLD_PID} 2>/dev/null || true
-    exit 1
-}
-
-log_info "Database build completed successfully"
+log_info "Skipping database build - using existing database"
 
 # Create results directory
 mkdir -p "${RESULTS_DIR}"
 
 # Create HammerDB run script for TPC-C test
 HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
+BENCHMARK_DURATION_MINUTES=$((BENCHMARK_DURATION_HOURS * 60))
 cat > "${HAMMERDB_RUN_TCL}" <<EOF
 #!/usr/bin/tclsh
 puts "SETTING CONFIGURATION FOR TPC-C RUN"
 dbset db mysql
 dbset bm TPC-C
 
-diset connection localhost
-diset connection mysql_port 3306
-diset connection mysql_socket null
+puts "Setting connection parameters..."
+diset connection mysql_host localhost
+diset connection mysql_socket /tmp/mysql-alloc-test.sock
 diset connection mysql_ssl false
 
-diset tpcc mysql_user root
-diset tpcc mysql_pass ""
+puts "Setting TPC-C parameters..."
+diset tpcc mysql_user tpcuser
+diset tpcc mysql_pass tpcpass
 diset tpcc mysql_dbase tpcc
 diset tpcc mysql_driver timed
 diset tpcc mysql_rampup 2
-diset tpcc mysql_duration $(($BENCHMARK_DURATION_HOURS * 60))
+diset tpcc mysql_duration ${BENCHMARK_DURATION_MINUTES}
 diset tpcc mysql_allwarehouse true
 diset tpcc mysql_timeprofile true
+diset tpcc mysql_history_pk true
 
+puts "Printing current configuration..."
+print dict
+
+puts "Creating ${VIRTUAL_USERS} virtual users..."
 vuset vu ${VIRTUAL_USERS}
+
+puts "Creating virtual user threads..."
 vucreate
-vurun
+
+puts "Running virtual users..."
+if {[catch {vurun} result]} {
+    puts "ERROR during vurun: \$result"
+    puts "Error Info: \$::errorInfo"
+    exit 1
+}
 
 puts "TPC-C TEST STARTED"
 EOF
@@ -374,47 +433,92 @@ log_info "Results directory: ${RESULTS_DIR}"
 START_TIME=$(date +%s)
 END_TIME=$((START_TIME + BENCHMARK_DURATION_HOURS * 3600))
 
-STATUS_FILE="${RESULTS_DIR}/mysql_status_$(date +%Y%m%d_%H%M%S).log"
-SMAPS_FILE="${RESULTS_DIR}/mysql_smaps_rollup_$(date +%Y%m%d_%H%M%S).log"
+DATE_TIME=$(date +%Y%m%d_%H%M%S)
+STATUS_FILE="${RESULTS_DIR}/mysql_status_${DATE_TIME}.log"
+SMAPS_ROLLUP_FILE="${RESULTS_DIR}/mysql_smaps_rollup_${DATE_TIME}.log"
+SMAPS_FILE="${RESULTS_DIR}/mysql_smaps_${DATE_TIME}.log"
+STAT_FILE="${RESULTS_DIR}/mysql_stat_${DATE_TIME}.log"
+MAPS_FILE="${RESULTS_DIR}/mysql_maps_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
 echo "# Started at: $(date)" >> "${STATUS_FILE}"
 echo "" >> "${STATUS_FILE}"
 
-echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection" > "${SMAPS_FILE}"
+echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection" > "${SMAPS_ROLLUP_FILE}"
+echo "# Started at: $(date)" >> "${SMAPS_ROLLUP_FILE}"
+echo "" >> "${SMAPS_ROLLUP_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/smaps data collection (every 30 seconds)" > "${SMAPS_FILE}"
 echo "# Started at: $(date)" >> "${SMAPS_FILE}"
 echo "" >> "${SMAPS_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/stat data collection" > "${STAT_FILE}"
+echo "# Started at: $(date)" >> "${STAT_FILE}"
+echo "" >> "${STAT_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/maps data collection" > "${MAPS_FILE}"
+echo "# Started at: $(date)" >> "${MAPS_FILE}"
+echo "" >> "${MAPS_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
     local pid=$1
     local status_file=$2
-    local smaps_file=$3
+    local smaps_rollup_file=$3
+    local smaps_file=$4
+    local stat_file=$5
+    local maps_file=$6
+
+    local iteration=0
 
     while kill -0 ${pid} 2>/dev/null && kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 
-        # Collect status
+        # Collect status (every 1 second)
         if [ -f "/proc/${pid}/status" ]; then
             echo "=== ${TIMESTAMP} ===" >> "${status_file}"
             cat /proc/${pid}/status >> "${status_file}" 2>/dev/null || true
             echo "" >> "${status_file}"
         fi
 
-        # Collect smaps_rollup
+        # Collect smaps_rollup (every 1 second)
         if [ -f "/proc/${pid}/smaps_rollup" ]; then
-            echo "=== ${TIMESTAMP} ===" >> "${smaps_file}"
-            cat /proc/${pid}/smaps_rollup >> "${smaps_file}" 2>/dev/null || true
-            echo "" >> "${smaps_file}"
+            echo "=== ${TIMESTAMP} ===" >> "${smaps_rollup_file}"
+            cat /proc/${pid}/smaps_rollup >> "${smaps_rollup_file}" 2>/dev/null || true
+            echo "" >> "${smaps_rollup_file}"
         fi
 
+        # Collect stat (every 1 second)
+        if [ -f "/proc/${pid}/stat" ]; then
+            echo "=== ${TIMESTAMP} ===" >> "${stat_file}"
+            cat /proc/${pid}/stat >> "${stat_file}" 2>/dev/null || true
+            echo "" >> "${stat_file}"
+        fi
+
+        # Collect maps (every 1 second)
+        if [ -f "/proc/${pid}/maps" ]; then
+            echo "=== ${TIMESTAMP} ===" >> "${maps_file}"
+            cat /proc/${pid}/maps >> "${maps_file}" 2>/dev/null || true
+            echo "" >> "${maps_file}"
+        fi
+
+        # Collect smaps (every 30 seconds)
+        if [ $((iteration % 30)) -eq 0 ]; then
+            if [ -f "/proc/${pid}/smaps" ]; then
+                echo "=== ${TIMESTAMP} ===" >> "${smaps_file}"
+                cat /proc/${pid}/smaps >> "${smaps_file}" 2>/dev/null || true
+                echo "" >> "${smaps_file}"
+            fi
+        fi
+
+        iteration=$((iteration + 1))
         sleep 1
     done
 }
 
 # Start data collection in background
-collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_FILE}" &
+collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
 COLLECTOR_PID=$!
 
 # Time reporting loop
@@ -468,7 +572,10 @@ log_info "Duration: ${BENCHMARK_DURATION_HOURS} hours"
 log_info "Results directory: ${RESULTS_DIR}"
 log_info "  - HammerDB output: ${RESULTS_DIR}/hammerdb_output.log"
 log_info "  - MySQL status data: ${STATUS_FILE}"
-log_info "  - MySQL smaps_rollup data: ${SMAPS_FILE}"
+log_info "  - MySQL smaps_rollup data: ${SMAPS_ROLLUP_FILE}"
+log_info "  - MySQL smaps data: ${SMAPS_FILE}"
+log_info "  - MySQL stat data: ${STAT_FILE}"
+log_info "  - MySQL maps data: ${MAPS_FILE}"
 log_info "======================================"
 
 exit ${HAMMERDB_EXIT}
