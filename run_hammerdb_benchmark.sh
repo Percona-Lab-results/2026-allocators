@@ -275,14 +275,14 @@ for i in {1..300}; do
         log_info "MySQL server is ready"
         break
     fi
-    if [ $i -eq 60 ]; then
-        log_error "MySQL server failed to start after 120 seconds"
+    if [ $i -eq 300 ]; then
+        log_error "MySQL server failed to start after 600 seconds"
         log_error "Last connection error: ${CONNECT_OUTPUT}"
         log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
         kill ${MYSQLD_PID} 2>/dev/null || true
         exit 1
     fi
-    log_warn "Connection attempt $i/60 failed, retrying... (${CONNECT_OUTPUT})"
+    log_warn "Connection attempt $i/300 failed, retrying... (${CONNECT_OUTPUT})"
     sleep 2
 done
 
