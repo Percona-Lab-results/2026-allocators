@@ -159,8 +159,8 @@ innodb_redo_log_capacity = 32G
 # Minimize flush overhead (not crash-safe, but optimal for testing)
 innodb_flush_log_at_trx_commit = 0
 
-# Memory configuration to target 140 GB buffer pool
-innodb_buffer_pool_size = 140G
+# Memory configuration to target 135 GB buffer pool
+innodb_buffer_pool_size = 135G
 innodb_buffer_pool_instances = 16
 
 # Connection settings
@@ -248,8 +248,8 @@ log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
 MYSQLD_PID=$!
 
 # Set OOM score adjustment to protect mysqld from OOM killer
-log_info "Setting OOM score adjustment to -900 for mysqld (PID: ${MYSQLD_PID})..."
-echo -900 | sudo tee /proc/${MYSQLD_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment"
+log_info "Setting OOM score adjustment to -500 for mysqld (PID: ${MYSQLD_PID})..."
+echo -500 | sudo tee /proc/${MYSQLD_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment"
 
 # Wait for server to be ready
 log_info "Waiting for MySQL server to be ready (PID: ${MYSQLD_PID})..."
@@ -459,6 +459,10 @@ log_info "Starting TPC-C benchmark: ${VIRTUAL_USERS} VUs for ${BENCHMARK_DURATIO
 # Start HammerDB in background
 "${HAMMERDB_CLI}" auto "${HAMMERDB_RUN_TCL}" > "${RESULTS_DIR}/hammerdb_output.log" 2>&1 &
 HAMMERDB_PID=$!
+
+# Set OOM score adjustment to protect hammerdbcli from OOM killer
+log_info "Setting OOM score adjustment to -500 for hammerdbcli (PID: ${HAMMERDB_PID})..."
+echo -500 | sudo tee /proc/${HAMMERDB_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment for hammerdbcli"
 
 # 9. Print remaining time every 10 seconds
 # 10. Collect /proc/<pid>/status every 1 second
