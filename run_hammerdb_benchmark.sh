@@ -266,6 +266,14 @@ fi
 
 for i in {1..300}; do
     log_info "Connecting to mysql client..."
+
+    # Check if mysqld process is still alive
+    if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
+        log_error "mysqld process (PID: ${MYSQLD_PID}) has died"
+        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+        exit 1
+    fi
+
     set +e
     CONNECT_OUTPUT=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -e "SELECT 1" 2>&1)
     MYSQL_EXIT_CODE=$?
