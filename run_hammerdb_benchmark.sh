@@ -159,8 +159,8 @@ innodb_redo_log_capacity = 32G
 # Minimize flush overhead (not crash-safe, but optimal for testing)
 innodb_flush_log_at_trx_commit = 0
 
-# Memory configuration to target 150 GB buffer pool
-innodb_buffer_pool_size = 150G
+# Memory configuration to target 140 GB buffer pool
+innodb_buffer_pool_size = 140G
 innodb_buffer_pool_instances = 16
 
 # Connection settings
