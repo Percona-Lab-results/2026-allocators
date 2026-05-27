@@ -197,31 +197,48 @@ fi
 log_info "Configuration file created successfully"
 
 # 4. Remove old server data directory and create fresh one
-# COMMENTED OUT TO SAVE TIME - UNCOMMENT TO REINITIALIZE
-#if [ -d "${SERVER_DATA_DIR}" ]; then
-#    log_info "Removing old server data directory: ${SERVER_DATA_DIR}"
-#    rm -rf "${SERVER_DATA_DIR}"
-#fi
-#
-#log_info "Creating fresh server data directory: ${SERVER_DATA_DIR}"
-#mkdir -p "${SERVER_DATA_DIR}"
-#
-## Initialize data directory
-#log_info "Initializing MySQL data directory..."
-#"${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
-#  --innodb_flush_log_at_trx_commit=0 \
-#  --innodb_doublewrite=0 \
-#  --sync_binlog=0 \
-#  --innodb_buffer_pool_size=1G
+if [ -d "${SERVER_DATA_DIR}" ]; then
+   log_info "Removing old server data directory: ${SERVER_DATA_DIR}"
+   rm -rf "${SERVER_DATA_DIR}"
+fi
+
+log_info "Creating fresh server data directory: ${SERVER_DATA_DIR}"
+mkdir -p "${SERVER_DATA_DIR}"
+
+# Initialize data directory
+log_info "Initializing MySQL data directory..."
+"${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
+ --innodb_flush_log_at_trx_commit=0 \
+ --innodb_doublewrite=0 \
+ --sync_binlog=0 \
+ --innodb_buffer_pool_size=1G
 
 # Ensure data directory exists (when skipping initialization)
 #mkdir -p "${SERVER_DATA_DIR}"
+
+# Set LD_PRELOAD for jemalloc36 if specified
+if [ "${ALLOCATOR}" = "jemalloc36" ]; then
+    SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
+    JEMALLOC_LIB="${SERVER_DIR}/lib/mysql/libjemalloc.so.1"
+
+    if [ -f "${JEMALLOC_LIB}" ]; then
+        export LD_PRELOAD="${JEMALLOC_LIB}"
+        log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
+    else
+        log_error "jemalloc36 library not found at: ${JEMALLOC_LIB}"
+        exit 1
+    fi
+fi
 
 # Start MySQL server
 log_info "Starting MySQL server..."
 log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
 "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
 MYSQLD_PID=$!
+
+# Set OOM score adjustment to protect mysqld from OOM killer
+log_info "Setting OOM score adjustment to -900 for mysqld (PID: ${MYSQLD_PID})..."
+echo -900 | sudo tee /proc/${MYSQLD_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment"
 
 # Wait for server to be ready
 log_info "Waiting for MySQL server to be ready (PID: ${MYSQLD_PID})..."
@@ -291,11 +308,11 @@ check_allocator() {
 
     case "${allocator}" in
         jemalloc36)
-            if grep -q "libjemalloc.*3\.6" /proc/${pid}/maps; then
-                log_info "Allocator check passed: jemalloc 3.6 is loaded"
+            if grep -q "libjemalloc\.so\.1" /proc/${pid}/maps; then
+                log_info "Allocator check passed: libjemalloc.so.1 is loaded"
                 return 0
             else
-                log_error "jemalloc 3.6 is not loaded in mysqld process"
+                log_error "libjemalloc.so.1 is not loaded in mysqld process"
                 log_error ""
                 log_error "To install and configure jemalloc 3.6 in Percona Server:"
                 log_error "1. Install jemalloc 3.6: sudo apt-get install libjemalloc1 (or build from source)"
@@ -355,17 +372,16 @@ if ! check_allocator ${MYSQLD_PID} "${ALLOCATOR}"; then
 fi
 
 # 7. Build the database using hammerdb_load.tcl
-# COMMENTED OUT TO SAVE TIME - UNCOMMENT TO REBUILD DATABASE
-#log_info "Building TPC-C database schema using HammerDB..."
-#log_info "This may take a while..."
-#
-#"${HAMMERDB_CLI}" auto "${HAMMERDB_LOAD_TCL}" || {
-#    log_error "Database build failed"
-#    kill ${MYSQLD_PID} 2>/dev/null || true
-#    exit 1
-#}
-#
-#log_info "Database build completed successfully"
+log_info "Building TPC-C database schema using HammerDB..."
+log_info "This may take a while..."
+
+"${HAMMERDB_CLI}" auto "${HAMMERDB_LOAD_TCL}" || {
+   log_error "Database build failed"
+   kill ${MYSQLD_PID} 2>/dev/null || true
+   exit 1
+}
+
+log_info "Database build completed successfully"
 
 log_info "Skipping database build - using existing database"
 
