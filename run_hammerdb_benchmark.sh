@@ -159,8 +159,8 @@ innodb_redo_log_capacity = 32G
 # Minimize flush overhead (not crash-safe, but optimal for testing)
 innodb_flush_log_at_trx_commit = 0
 
-# Memory configuration to target 130 GB buffer pool
-innodb_buffer_pool_size = 130G
+# Memory configuration to target 125 GB buffer pool
+innodb_buffer_pool_size = 125G
 innodb_buffer_pool_instances = 16
 
 # Connection settings
@@ -248,8 +248,8 @@ log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
 MYSQLD_PID=$!
 
 # Set OOM score adjustment to protect mysqld from OOM killer
-log_info "Setting OOM score adjustment to -500 for mysqld (PID: ${MYSQLD_PID})..."
-echo -500 | sudo tee /proc/${MYSQLD_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment"
+# log_info "Setting OOM score adjustment to -500 for mysqld (PID: ${MYSQLD_PID})..."
+# echo -500 | sudo tee /proc/${MYSQLD_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment"
 
 # Wait for server to be ready
 log_info "Waiting for MySQL server to be ready (PID: ${MYSQLD_PID})..."
@@ -457,12 +457,13 @@ EOF
 log_info "Starting TPC-C benchmark: ${VIRTUAL_USERS} VUs for ${BENCHMARK_DURATION_HOURS} hours"
 
 # Start HammerDB in background
-"${HAMMERDB_CLI}" auto "${HAMMERDB_RUN_TCL}" > "${RESULTS_DIR}/hammerdb_output.log" 2>&1 &
+HAMMERDB_OUTPUT_FILE="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output.log"
+"${HAMMERDB_CLI}" auto "${HAMMERDB_RUN_TCL}" > "${HAMMERDB_OUTPUT_FILE}" 2>&1 &
 HAMMERDB_PID=$!
 
 # Set OOM score adjustment to protect hammerdbcli from OOM killer
-log_info "Setting OOM score adjustment to -500 for hammerdbcli (PID: ${HAMMERDB_PID})..."
-echo -500 | sudo tee /proc/${HAMMERDB_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment for hammerdbcli"
+# log_info "Setting OOM score adjustment to -500 for hammerdbcli (PID: ${HAMMERDB_PID})..."
+# echo -500 | sudo tee /proc/${HAMMERDB_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment for hammerdbcli"
 
 # 9. Print remaining time every 10 seconds
 # 10. Collect /proc/<pid>/status every 1 second
@@ -475,11 +476,13 @@ START_TIME=$(date +%s)
 END_TIME=$((START_TIME + BENCHMARK_DURATION_HOURS * 3600))
 
 DATE_TIME=$(date +%Y%m%d_%H%M%S)
-STATUS_FILE="${RESULTS_DIR}/mysql_status_${DATE_TIME}.log"
-SMAPS_ROLLUP_FILE="${RESULTS_DIR}/mysql_smaps_rollup_${DATE_TIME}.log"
-SMAPS_FILE="${RESULTS_DIR}/mysql_smaps_${DATE_TIME}.log"
-STAT_FILE="${RESULTS_DIR}/mysql_stat_${DATE_TIME}.log"
-MAPS_FILE="${RESULTS_DIR}/mysql_maps_${DATE_TIME}.log"
+FILE_PREFIX="${THP_ENABLED}_${ALLOCATOR}"
+STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_status_${DATE_TIME}.log"
+SMAPS_ROLLUP_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_rollup_${DATE_TIME}.log"
+SMAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_${DATE_TIME}.log"
+STAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_stat_${DATE_TIME}.log"
+MAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_maps_${DATE_TIME}.log"
+RSS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_rss_memory_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -501,6 +504,11 @@ echo "" >> "${STAT_FILE}"
 echo "# MySQL /proc/${MYSQLD_PID}/maps data collection" > "${MAPS_FILE}"
 echo "# Started at: $(date)" >> "${MAPS_FILE}"
 echo "" >> "${MAPS_FILE}"
+
+echo "# RSS (Resident Memory Size) monitoring for mysqld and hammerdbcli" > "${RSS_FILE}"
+echo "# Started at: $(date)" >> "${RSS_FILE}"
+echo "# Format: Timestamp, mysqld_PID, mysqld_RSS_KB, hammerdbcli_PID, hammerdbcli_RSS_KB" >> "${RSS_FILE}"
+echo "" >> "${RSS_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -558,9 +566,43 @@ collect_proc_data() {
     done
 }
 
+# RSS monitoring function
+collect_rss_data() {
+    local mysqld_pid=$1
+    local hammerdb_pid=$2
+    local rss_file=$3
+
+    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+
+        # Get RSS for mysqld (in KB)
+        MYSQLD_RSS=0
+        if [ -f "/proc/${mysqld_pid}/status" ]; then
+            MYSQLD_RSS=$(grep "^VmRSS:" /proc/${mysqld_pid}/status 2>/dev/null | awk '{print $2}')
+            [ -z "${MYSQLD_RSS}" ] && MYSQLD_RSS=0
+        fi
+
+        # Get RSS for hammerdbcli (in KB)
+        HAMMERDB_RSS=0
+        if [ -f "/proc/${hammerdb_pid}/status" ]; then
+            HAMMERDB_RSS=$(grep "^VmRSS:" /proc/${hammerdb_pid}/status 2>/dev/null | awk '{print $2}')
+            [ -z "${HAMMERDB_RSS}" ] && HAMMERDB_RSS=0
+        fi
+
+        # Write to log file in CSV format
+        echo "${TIMESTAMP}, ${mysqld_pid}, ${MYSQLD_RSS}, ${hammerdb_pid}, ${HAMMERDB_RSS}" >> "${rss_file}"
+
+        sleep 1
+    done
+}
+
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
 COLLECTOR_PID=$!
+
+# Start RSS monitoring in background
+collect_rss_data ${MYSQLD_PID} ${HAMMERDB_PID} "${RSS_FILE}" &
+RSS_COLLECTOR_PID=$!
 
 # Time reporting loop
 LAST_REPORT=0
@@ -571,6 +613,22 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
 
     if [ $REMAINING -lt 0 ]; then
         REMAINING=0
+    fi
+
+    # Check if mysqld process is still alive
+    if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
+        log_error "mysqld process (PID: ${MYSQLD_PID}) has died unexpectedly!"
+        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+        kill ${HAMMERDB_PID} 2>/dev/null || true
+        kill ${COLLECTOR_PID} 2>/dev/null || true
+        kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+        exit 1
+    fi
+
+    # Check if hammerdbcli process is still alive
+    if ! kill -0 ${HAMMERDB_PID} 2>/dev/null; then
+        log_error "hammerdbcli process (PID: ${HAMMERDB_PID}) has died unexpectedly!"
+        break
     fi
 
     # Report every 10 seconds
@@ -594,6 +652,9 @@ HAMMERDB_EXIT=$?
 kill ${COLLECTOR_PID} 2>/dev/null || true
 wait ${COLLECTOR_PID} 2>/dev/null || true
 
+kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+wait ${RSS_COLLECTOR_PID} 2>/dev/null || true
+
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
 # Stop MySQL server
@@ -611,12 +672,13 @@ log_info "THP enabled: ${THP_ENABLED}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
 log_info "Duration: ${BENCHMARK_DURATION_HOURS} hours"
 log_info "Results directory: ${RESULTS_DIR}"
-log_info "  - HammerDB output: ${RESULTS_DIR}/hammerdb_output.log"
+log_info "  - HammerDB output: ${HAMMERDB_OUTPUT_FILE}"
 log_info "  - MySQL status data: ${STATUS_FILE}"
 log_info "  - MySQL smaps_rollup data: ${SMAPS_ROLLUP_FILE}"
 log_info "  - MySQL smaps data: ${SMAPS_FILE}"
 log_info "  - MySQL stat data: ${STAT_FILE}"
 log_info "  - MySQL maps data: ${MAPS_FILE}"
+log_info "  - RSS memory data: ${RSS_FILE}"
 log_info "======================================"
 
 exit ${HAMMERDB_EXIT}
