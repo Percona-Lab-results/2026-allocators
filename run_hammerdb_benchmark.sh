@@ -605,13 +605,13 @@ collect_rss_data() {
         # Write to log file in CSV format
         echo "${TIMESTAMP}, ${mysqld_pid}, ${MYSQLD_RSS}, ${hammerdb_pid}, ${HAMMERDB_RSS}" >> "${rss_file}"
 
-        # Check if combined RSS exceeds 182GB (190840832 KB)
+        # Check if combined RSS exceeds 180GB  (188743680 KB)
         COMBINED_RSS=$((MYSQLD_RSS + HAMMERDB_RSS))
-        RSS_LIMIT_KB=190840832  # 182 GB in KB
+        RSS_LIMIT_KB=188743680  # 180 GB in KB
 
         if [ ${COMBINED_RSS} -gt ${RSS_LIMIT_KB} ]; then
             COMBINED_RSS_GB=$((COMBINED_RSS / 1024 / 1024))
-            log_error "Combined RSS (${COMBINED_RSS_GB} GB) exceeded limit of 182 GB!"
+            log_error "Combined RSS (${COMBINED_RSS_GB} GB) exceeded limit of 180 GB!"
             log_error "mysqld RSS: $((MYSQLD_RSS / 1024 / 1024)) GB, hammerdbcli RSS: $((HAMMERDB_RSS / 1024 / 1024)) GB"
             log_error "Terminating benchmark due to memory limit exceeded"
 
