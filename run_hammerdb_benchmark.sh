@@ -124,6 +124,19 @@ else
     fi
 fi
 
+# Copy generic.xml to HammerDB config directory
+GENERIC_XML="${SCRIPT_DIR}/generic.xml"
+HAMMERDB_CONFIG_DIR="${SCRIPT_DIR}/HammerDB-5.0/config"
+
+if [ -f "${GENERIC_XML}" ]; then
+    log_info "Copying generic.xml to HammerDB config directory..."
+    mkdir -p "${HAMMERDB_CONFIG_DIR}"
+    cp "${GENERIC_XML}" "${HAMMERDB_CONFIG_DIR}/generic.xml"
+    log_info "generic.xml copied successfully"
+else
+    log_warn "generic.xml not found at ${GENERIC_XML}, skipping copy"
+fi
+
 # Verify hammerdb_load.tcl exists
 if [ ! -f "${HAMMERDB_LOAD_TCL}" ]; then
     log_error "HammerDB load script not found: ${HAMMERDB_LOAD_TCL}"
@@ -160,7 +173,7 @@ innodb_redo_log_capacity = 32G
 innodb_flush_log_at_trx_commit = 0
 
 # Memory configuration to target 125 GB buffer pool
-innodb_buffer_pool_size = 125G
+innodb_buffer_pool_size = 140G
 innodb_buffer_pool_instances = 16
 
 # Connection settings
@@ -591,6 +604,24 @@ collect_rss_data() {
 
         # Write to log file in CSV format
         echo "${TIMESTAMP}, ${mysqld_pid}, ${MYSQLD_RSS}, ${hammerdb_pid}, ${HAMMERDB_RSS}" >> "${rss_file}"
+
+        # Check if combined RSS exceeds 182GB (190840832 KB)
+        COMBINED_RSS=$((MYSQLD_RSS + HAMMERDB_RSS))
+        RSS_LIMIT_KB=190840832  # 182 GB in KB
+
+        if [ ${COMBINED_RSS} -gt ${RSS_LIMIT_KB} ]; then
+            COMBINED_RSS_GB=$((COMBINED_RSS / 1024 / 1024))
+            log_error "Combined RSS (${COMBINED_RSS_GB} GB) exceeded limit of 182 GB!"
+            log_error "mysqld RSS: $((MYSQLD_RSS / 1024 / 1024)) GB, hammerdbcli RSS: $((HAMMERDB_RSS / 1024 / 1024)) GB"
+            log_error "Terminating benchmark due to memory limit exceeded"
+
+            # Kill processes
+            kill ${mysqld_pid} 2>/dev/null || true
+            kill ${hammerdb_pid} 2>/dev/null || true
+            kill ${COLLECTOR_PID} 2>/dev/null || true
+
+            exit 1
+        fi
 
         sleep 1
     done
