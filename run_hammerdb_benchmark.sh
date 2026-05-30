@@ -74,68 +74,27 @@ log_info "Checking HammerDB 5.0 installation..."
 HAMMERDB_CLI=""
 
 # First check current directory
-if [ -f "${SCRIPT_DIR}/HammerDB-5.0/hammerdbcli" ]; then
-    HAMMERDB_CLI="${SCRIPT_DIR}/HammerDB-5.0/hammerdbcli"
+if [ -f "${SCRIPT_DIR}/HammerDB-6.0/hammerdbcli" ]; then
+    HAMMERDB_CLI="${SCRIPT_DIR}/HammerDB-6.0/hammerdbcli"
     log_info "Found HammerDB in current directory: ${HAMMERDB_CLI}"
 else
     # Not in current directory, try to download
-    log_info "HammerDB not found in current directory, downloading..."
-
-    HAMMERDB_URL="https://github.com/TPC-Council/HammerDB/releases/download/v5.0/HammerDB-5.0-Prod-Lin-UBU22.tar.gz"
-    HAMMERDB_TARBALL="${SCRIPT_DIR}/HammerDB-5.0-Prod-Lin-UBU22.tar.gz"
-
-    # Download HammerDB
-    if ! command -v wget &> /dev/null && ! command -v curl &> /dev/null; then
-        log_error "Neither wget nor curl found. Please install one of them to download HammerDB."
-        exit 1
-    fi
-
-    if command -v wget &> /dev/null; then
-        log_info "Downloading with wget..."
-        wget -O "${HAMMERDB_TARBALL}" "${HAMMERDB_URL}" || {
-            log_error "Failed to download HammerDB from ${HAMMERDB_URL}"
-            exit 1
-        }
-    else
-        log_info "Downloading with curl..."
-        curl -L -o "${HAMMERDB_TARBALL}" "${HAMMERDB_URL}" || {
-            log_error "Failed to download HammerDB from ${HAMMERDB_URL}"
-            exit 1
-        }
-    fi
-
-    # Extract HammerDB
-    log_info "Extracting HammerDB to ${SCRIPT_DIR}..."
-    tar -xzf "${HAMMERDB_TARBALL}" -C "${SCRIPT_DIR}" || {
-        log_error "Failed to extract HammerDB tarball"
-        exit 1
-    }
-
-    # Clean up tarball
-    rm -f "${HAMMERDB_TARBALL}"
-
-    # Verify extraction
-    if [ -f "${SCRIPT_DIR}/HammerDB-5.0/hammerdbcli" ]; then
-        HAMMERDB_CLI="${SCRIPT_DIR}/HammerDB-5.0/hammerdbcli"
-        log_info "HammerDB successfully downloaded and extracted: ${HAMMERDB_CLI}"
-    else
-        log_error "HammerDB extraction failed - hammerdbcli not found after extraction"
-        exit 1
-    fi
+    log_info "HammerDB not found in current directory..."
+    exit 1
 fi
 
 # Copy generic.xml to HammerDB config directory
-GENERIC_XML="${SCRIPT_DIR}/generic.xml"
-HAMMERDB_CONFIG_DIR="${SCRIPT_DIR}/HammerDB-5.0/config"
+# GENERIC_XML="${SCRIPT_DIR}/generic.xml"
+# HAMMERDB_CONFIG_DIR="${SCRIPT_DIR}/HammerDB-5.0/config"
 
-if [ -f "${GENERIC_XML}" ]; then
-    log_info "Copying generic.xml to HammerDB config directory..."
-    mkdir -p "${HAMMERDB_CONFIG_DIR}"
-    cp "${GENERIC_XML}" "${HAMMERDB_CONFIG_DIR}/generic.xml"
-    log_info "generic.xml copied successfully"
-else
-    log_warn "generic.xml not found at ${GENERIC_XML}, skipping copy"
-fi
+# if [ -f "${GENERIC_XML}" ]; then
+#     log_info "Copying generic.xml to HammerDB config directory..."
+#     mkdir -p "${HAMMERDB_CONFIG_DIR}"
+#     cp "${GENERIC_XML}" "${HAMMERDB_CONFIG_DIR}/generic.xml"
+#     log_info "generic.xml copied successfully"
+# else
+#     log_warn "generic.xml not found at ${GENERIC_XML}, skipping copy"
+# fi
 
 # Verify hammerdb_load.tcl exists
 if [ ! -f "${HAMMERDB_LOAD_TCL}" ]; then
@@ -172,8 +131,8 @@ innodb_redo_log_capacity = 32G
 # Minimize flush overhead (not crash-safe, but optimal for testing)
 innodb_flush_log_at_trx_commit = 0
 
-# Memory configuration to target 125 GB buffer pool
-innodb_buffer_pool_size = 140G
+# Memory configuration to target 130 GB buffer pool
+innodb_buffer_pool_size = 130G
 innodb_buffer_pool_instances = 16
 
 # Connection settings
