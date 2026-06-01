@@ -460,6 +460,7 @@ MAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_maps_${DATE_TIME}.log"
 RSS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_rss_memory_${DATE_TIME}.log"
 GLOBAL_STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_status_${DATE_TIME}.log"
 GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
+VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -494,6 +495,10 @@ echo "" >> "${GLOBAL_STATUS_FILE}"
 echo "# MySQL SHOW GLOBAL VARIABLES data collection (every 30 seconds)" > "${GLOBAL_VARS_FILE}"
 echo "# Started at: $(date)" >> "${GLOBAL_VARS_FILE}"
 echo "" >> "${GLOBAL_VARS_FILE}"
+
+echo "# vmstat system statistics (every 1 second)" > "${VMSTAT_FILE}"
+echo "# Started at: $(date)" >> "${VMSTAT_FILE}"
+echo "" >> "${VMSTAT_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -591,6 +596,8 @@ collect_rss_data() {
             kill ${mysqld_pid} 2>/dev/null || true
             kill ${hammerdb_pid} 2>/dev/null || true
             kill ${COLLECTOR_PID} 2>/dev/null || true
+            kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+            kill ${VMSTAT_PID} 2>/dev/null || true
 
             exit 1
         fi
@@ -631,6 +638,26 @@ collect_mysql_globals() {
     done
 }
 
+# vmstat system statistics monitoring function
+collect_vmstat() {
+    local vmstat_file=$1
+    local mysqld_pid=$2
+    local hammerdb_pid=$3
+
+    # Run vmstat 1 to get output every 1 second
+    # The first line will be averages since boot, then real-time data
+    vmstat -t 1 > "${vmstat_file}" 2>&1 &
+    local vmstat_pid=$!
+
+    # Monitor and kill vmstat when benchmark stops
+    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        sleep 5
+    done
+
+    # Kill vmstat when benchmark is done
+    kill ${vmstat_pid} 2>/dev/null || true
+}
+
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
 COLLECTOR_PID=$!
@@ -642,6 +669,10 @@ RSS_COLLECTOR_PID=$!
 # Start MySQL global status/variables monitoring in background
 collect_mysql_globals "${MYSQL_CLIENT}" "${MYSQL_SOCKET}" "${GLOBAL_STATUS_FILE}" "${GLOBAL_VARS_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
 MYSQL_GLOBALS_PID=$!
+
+# Start vmstat monitoring in background
+collect_vmstat "${VMSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+VMSTAT_PID=$!
 
 # Time reporting loop
 LAST_REPORT=0
@@ -662,6 +693,7 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         kill ${COLLECTOR_PID} 2>/dev/null || true
         kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
         kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+        kill ${VMSTAT_PID} 2>/dev/null || true
         exit 1
     fi
 
@@ -698,6 +730,9 @@ wait ${RSS_COLLECTOR_PID} 2>/dev/null || true
 kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
 wait ${MYSQL_GLOBALS_PID} 2>/dev/null || true
 
+kill ${VMSTAT_PID} 2>/dev/null || true
+wait ${VMSTAT_PID} 2>/dev/null || true
+
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
 # Stop MySQL server
@@ -724,6 +759,7 @@ log_info "  - MySQL maps data: ${MAPS_FILE}"
 log_info "  - RSS memory data: ${RSS_FILE}"
 log_info "  - MySQL global status data: ${GLOBAL_STATUS_FILE}"
 log_info "  - MySQL global variables data: ${GLOBAL_VARS_FILE}"
+log_info "  - vmstat system statistics: ${VMSTAT_FILE}"
 log_info "======================================"
 
 exit ${HAMMERDB_EXIT}
