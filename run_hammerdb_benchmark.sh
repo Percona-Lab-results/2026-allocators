@@ -131,9 +131,11 @@ innodb_redo_log_capacity = 32G
 # Minimize flush overhead (not crash-safe, but optimal for testing)
 innodb_flush_log_at_trx_commit = 0
 
-# Memory configuration to target 130 GB buffer pool
-innodb_buffer_pool_size = 130G
+# Memory configuration to target 110 GB buffer pool
+innodb_buffer_pool_size = 110G
 innodb_buffer_pool_instances = 16
+innodb_max_dirty_pages_pct = 50
+innodb_io_capacity = 20000
 
 # Connection settings
 max_connections = 200
@@ -405,6 +407,7 @@ diset tpcc mysql_duration ${BENCHMARK_DURATION_MINUTES}
 diset tpcc mysql_allwarehouse true
 diset tpcc mysql_timeprofile true
 diset tpcc mysql_history_pk true
+diset tpcc mysql_total_iterations 100000000
 
 puts "Printing current configuration..."
 print dict
@@ -455,6 +458,8 @@ SMAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_${DATE_TIME}.log"
 STAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_stat_${DATE_TIME}.log"
 MAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_maps_${DATE_TIME}.log"
 RSS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_rss_memory_${DATE_TIME}.log"
+GLOBAL_STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_status_${DATE_TIME}.log"
+GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -481,6 +486,14 @@ echo "# RSS (Resident Memory Size) monitoring for mysqld and hammerdbcli" > "${R
 echo "# Started at: $(date)" >> "${RSS_FILE}"
 echo "# Format: Timestamp, mysqld_PID, mysqld_RSS_KB, hammerdbcli_PID, hammerdbcli_RSS_KB" >> "${RSS_FILE}"
 echo "" >> "${RSS_FILE}"
+
+echo "# MySQL SHOW GLOBAL STATUS data collection (every 30 seconds)" > "${GLOBAL_STATUS_FILE}"
+echo "# Started at: $(date)" >> "${GLOBAL_STATUS_FILE}"
+echo "" >> "${GLOBAL_STATUS_FILE}"
+
+echo "# MySQL SHOW GLOBAL VARIABLES data collection (every 30 seconds)" > "${GLOBAL_VARS_FILE}"
+echo "# Started at: $(date)" >> "${GLOBAL_VARS_FILE}"
+echo "" >> "${GLOBAL_VARS_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -586,6 +599,38 @@ collect_rss_data() {
     done
 }
 
+# MySQL global status and variables monitoring function
+collect_mysql_globals() {
+    local mysql_client=$1
+    local mysql_socket=$2
+    local global_status_file=$3
+    local global_vars_file=$4
+    local mysqld_pid=$5
+    local hammerdb_pid=$6
+
+    local iteration=0
+
+    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        # Collect every 30 seconds
+        if [ $((iteration % 30)) -eq 0 ]; then
+            TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+
+            # Collect SHOW GLOBAL STATUS
+            echo "=== ${TIMESTAMP} ===" >> "${global_status_file}"
+            "${mysql_client}" --socket="${mysql_socket}" -u root -e "SHOW GLOBAL STATUS;" >> "${global_status_file}" 2>/dev/null || true
+            echo "" >> "${global_status_file}"
+
+            # Collect SHOW GLOBAL VARIABLES
+            echo "=== ${TIMESTAMP} ===" >> "${global_vars_file}"
+            "${mysql_client}" --socket="${mysql_socket}" -u root -e "SHOW GLOBAL VARIABLES;" >> "${global_vars_file}" 2>/dev/null || true
+            echo "" >> "${global_vars_file}"
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 1
+    done
+}
+
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
 COLLECTOR_PID=$!
@@ -593,6 +638,10 @@ COLLECTOR_PID=$!
 # Start RSS monitoring in background
 collect_rss_data ${MYSQLD_PID} ${HAMMERDB_PID} "${RSS_FILE}" &
 RSS_COLLECTOR_PID=$!
+
+# Start MySQL global status/variables monitoring in background
+collect_mysql_globals "${MYSQL_CLIENT}" "${MYSQL_SOCKET}" "${GLOBAL_STATUS_FILE}" "${GLOBAL_VARS_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+MYSQL_GLOBALS_PID=$!
 
 # Time reporting loop
 LAST_REPORT=0
@@ -612,6 +661,7 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         kill ${HAMMERDB_PID} 2>/dev/null || true
         kill ${COLLECTOR_PID} 2>/dev/null || true
         kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+        kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
         exit 1
     fi
 
@@ -645,6 +695,9 @@ wait ${COLLECTOR_PID} 2>/dev/null || true
 kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
 wait ${RSS_COLLECTOR_PID} 2>/dev/null || true
 
+kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+wait ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
 # Stop MySQL server
@@ -669,6 +722,8 @@ log_info "  - MySQL smaps data: ${SMAPS_FILE}"
 log_info "  - MySQL stat data: ${STAT_FILE}"
 log_info "  - MySQL maps data: ${MAPS_FILE}"
 log_info "  - RSS memory data: ${RSS_FILE}"
+log_info "  - MySQL global status data: ${GLOBAL_STATUS_FILE}"
+log_info "  - MySQL global variables data: ${GLOBAL_VARS_FILE}"
 log_info "======================================"
 
 exit ${HAMMERDB_EXIT}
