@@ -592,12 +592,12 @@ collect_rss_data() {
             log_error "mysqld RSS: $((MYSQLD_RSS / 1024 / 1024)) GB, hammerdbcli RSS: $((HAMMERDB_RSS / 1024 / 1024)) GB"
             log_error "Terminating benchmark due to memory limit exceeded"
 
-            # Kill processes
+            # Kill processes (only if PID variables are set)
             kill ${mysqld_pid} 2>/dev/null || true
             kill ${hammerdb_pid} 2>/dev/null || true
-            kill ${COLLECTOR_PID} 2>/dev/null || true
-            kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
-            kill ${VMSTAT_PID} 2>/dev/null || true
+            [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+            [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+            [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
 
             exit 1
         fi
@@ -658,6 +658,12 @@ collect_vmstat() {
     kill ${vmstat_pid} 2>/dev/null || true
 }
 
+# Initialize background process PIDs
+COLLECTOR_PID=""
+RSS_COLLECTOR_PID=""
+MYSQL_GLOBALS_PID=""
+VMSTAT_PID=""
+
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
 COLLECTOR_PID=$!
@@ -690,10 +696,10 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         log_error "mysqld process (PID: ${MYSQLD_PID}) has died unexpectedly!"
         log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
         kill ${HAMMERDB_PID} 2>/dev/null || true
-        kill ${COLLECTOR_PID} 2>/dev/null || true
-        kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
-        kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
-        kill ${VMSTAT_PID} 2>/dev/null || true
+        [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+        [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+        [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+        [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
         exit 1
     fi
 
@@ -721,17 +727,17 @@ wait ${HAMMERDB_PID}
 HAMMERDB_EXIT=$?
 
 # Stop data collection
-kill ${COLLECTOR_PID} 2>/dev/null || true
-wait ${COLLECTOR_PID} 2>/dev/null || true
+[ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+[ -n "${COLLECTOR_PID}" ] && wait ${COLLECTOR_PID} 2>/dev/null || true
 
-kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
-wait ${RSS_COLLECTOR_PID} 2>/dev/null || true
+[ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+[ -n "${RSS_COLLECTOR_PID}" ] && wait ${RSS_COLLECTOR_PID} 2>/dev/null || true
 
-kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
-wait ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+[ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+[ -n "${MYSQL_GLOBALS_PID}" ] && wait ${MYSQL_GLOBALS_PID} 2>/dev/null || true
 
-kill ${VMSTAT_PID} 2>/dev/null || true
-wait ${VMSTAT_PID} 2>/dev/null || true
+[ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+[ -n "${VMSTAT_PID}" ] && wait ${VMSTAT_PID} 2>/dev/null || true
 
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
