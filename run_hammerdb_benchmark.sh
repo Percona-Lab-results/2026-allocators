@@ -38,15 +38,24 @@ sleep 2
 
 # Check command line arguments
 if [ $# -lt 4 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <suffix> [skip_init:skip|noskip]"
+    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> [skip_init:skip|noskip] <suffix>"
     exit 1
 fi
 
 SERVER_BINARY="$1"
 THP_ENABLED="$2"
 ALLOCATOR="$3"
-RESULTS_SUFFIX="$4"
-SKIP_INIT="${5:-noskip}"  # Default to "noskip" if not provided
+
+# Handle optional skip_init parameter and required suffix
+if [ $# -eq 4 ]; then
+    # Only 4 args: suffix is 4th, skip_init defaults to "noskip"
+    SKIP_INIT="noskip"
+    RESULTS_SUFFIX="$4"
+else
+    # 5 args: skip_init is 4th, suffix is 5th
+    SKIP_INIT="$4"
+    RESULTS_SUFFIX="$5"
+fi
 
 # Set results directory with suffix
 RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}"
