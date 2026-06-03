@@ -6,7 +6,6 @@ set -euo pipefail
 # Example: ./run_hammerdb_benchmark.sh /opt/percona-server/bin/mysqld yes jemalloc53
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="${SCRIPT_DIR}/results"
 SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
@@ -38,15 +37,19 @@ sudo killall mysqld 2>/dev/null || true
 sleep 2
 
 # Check command line arguments
-if [ $# -lt 3 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> [skip_init:skip|noskip]"
+if [ $# -lt 4 ]; then
+    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <suffix> [skip_init:skip|noskip]"
     exit 1
 fi
 
 SERVER_BINARY="$1"
 THP_ENABLED="$2"
 ALLOCATOR="$3"
-SKIP_INIT="${4:-noskip}"  # Default to "noskip" if not provided
+RESULTS_SUFFIX="$4"
+SKIP_INIT="${5:-noskip}"  # Default to "noskip" if not provided
+
+# Set results directory with suffix
+RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}"
 
 # Validate inputs
 if [ ! -f "${SERVER_BINARY}" ]; then
@@ -715,7 +718,7 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         MINUTES=$(((REMAINING % 3600) / 60))
         SECONDS=$((REMAINING % 60))
 
-        log_info "Benchmark progress - Time remaining: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+        log_info "Benchmark progress (${RESULTS_SUFFIX}) - Time remaining: ${HOURS}h ${MINUTES}m ${SECONDS}s"
         LAST_REPORT=$ELAPSED
     fi
 
@@ -753,6 +756,7 @@ log_info "======================================"
 log_info "Server binary: ${SERVER_BINARY}"
 log_info "Allocator: ${ALLOCATOR}"
 log_info "THP enabled: ${THP_ENABLED}"
+log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
 log_info "Duration: ${BENCHMARK_DURATION_HOURS} hours"
 log_info "Results directory: ${RESULTS_DIR}"
