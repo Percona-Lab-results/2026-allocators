@@ -212,7 +212,7 @@ else
     fi
 fi
 
-# Set LD_PRELOAD for jemalloc36 if specified
+# Set LD_PRELOAD for jemalloc if specified
 if [ "${ALLOCATOR}" = "jemalloc36" ]; then
     SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
     JEMALLOC_LIB="${SERVER_DIR}/lib/mysql/libjemalloc.so.1"
@@ -222,6 +222,17 @@ if [ "${ALLOCATOR}" = "jemalloc36" ]; then
         log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
     else
         log_error "jemalloc36 library not found at: ${JEMALLOC_LIB}"
+        exit 1
+    fi
+elif [ "${ALLOCATOR}" = "jemalloc53" ]; then
+    JEMALLOC_LIB="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+
+    if [ -f "${JEMALLOC_LIB}" ]; then
+        export LD_PRELOAD="${JEMALLOC_LIB}"
+        log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
+    else
+        log_error "jemalloc53 library not found at: ${JEMALLOC_LIB}"
+        log_error "Install with: sudo apt-get install libjemalloc2"
         exit 1
     fi
 fi
@@ -327,7 +338,7 @@ check_allocator() {
             fi
             ;;
         jemalloc53)
-            if grep -q "libjemalloc.*5\.3" /proc/${pid}/maps; then
+            if grep -q "libjemalloc.so.2" /proc/${pid}/maps; then
                 log_info "Allocator check passed: jemalloc 5.3 is loaded"
                 return 0
             else
