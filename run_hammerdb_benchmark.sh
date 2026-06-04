@@ -14,7 +14,8 @@ SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
 MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
-BENCHMARK_DURATION_HOURS=20
+BENCHMARK_DURATION_MINUTES=1200  # 20 hours = 1200 minutes
+RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
 
 # Colors for output
@@ -54,8 +55,8 @@ SKIP_INIT="$4"
 BUFFER_POOL_SIZE_GB="$5"
 RESULTS_SUFFIX="$6"
 
-# Set results directory with suffix
-RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}"
+# Set results directory with suffix and parameters
+RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G"
 
 # Validate inputs
 if [ ! -f "${SERVER_BINARY}" ]; then
@@ -407,7 +408,7 @@ mkdir -p "${RESULTS_DIR}"
 
 # Create HammerDB run script for TPC-C test
 HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
-BENCHMARK_DURATION_MINUTES=$((BENCHMARK_DURATION_HOURS * 60))
+
 cat > "${HAMMERDB_RUN_TCL}" <<EOF
 #!/usr/bin/tclsh
 puts "SETTING CONFIGURATION FOR TPC-C RUN"
@@ -424,7 +425,7 @@ diset tpcc mysql_user tpcuser
 diset tpcc mysql_pass tpcpass
 diset tpcc mysql_dbase tpcc
 diset tpcc mysql_driver timed
-diset tpcc mysql_rampup 2
+diset tpcc mysql_rampup ${RAMPUP_DURATION_MINUTES}
 diset tpcc mysql_duration ${BENCHMARK_DURATION_MINUTES}
 diset tpcc mysql_allwarehouse true
 diset tpcc mysql_timeprofile true
@@ -450,13 +451,48 @@ if {[catch {vurun} result]} {
 puts "TPC-C TEST STARTED"
 EOF
 
-# 8. Run TPC-C test with 80 Virtual Users for 20 hours
-log_info "Starting TPC-C benchmark: ${VIRTUAL_USERS} VUs for ${BENCHMARK_DURATION_HOURS} hours"
+# 8. Run TPC-C test with configured Virtual Users and duration
+TOTAL_DURATION_MINUTES=$((BENCHMARK_DURATION_MINUTES + RAMPUP_DURATION_MINUTES))
+BENCHMARK_DURATION_HOURS=$((BENCHMARK_DURATION_MINUTES / 60))
+TOTAL_DURATION_HOURS=$((TOTAL_DURATION_MINUTES / 60))
+log_info "Starting TPC-C benchmark: ${VIRTUAL_USERS} VUs"
+log_info "  Ramp-up: ${RAMPUP_DURATION_MINUTES} minutes"
+log_info "  Benchmark: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
+log_info "  Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
 
 # Start HammerDB in background
 HAMMERDB_OUTPUT_FILE="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output.log"
 "${HAMMERDB_CLI}" auto "${HAMMERDB_RUN_TCL}" > "${HAMMERDB_OUTPUT_FILE}" 2>&1 &
 HAMMERDB_PID=$!
+
+# Set up trap to gracefully stop HammerDB on script termination
+trap_handler() {
+    log_warn "Received termination signal, stopping benchmark gracefully..."
+    if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
+        log_info "Sending SIGINT to HammerDB (PID: ${HAMMERDB_PID}) to generate summary..."
+        kill -INT ${HAMMERDB_PID} 2>/dev/null || true
+        log_info "Waiting for HammerDB to finish writing summary..."
+        wait ${HAMMERDB_PID} 2>/dev/null || true
+    fi
+
+    # Stop data collectors
+    [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+    [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+    [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+    [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+
+    # Stop MySQL
+    if kill -0 ${MYSQLD_PID} 2>/dev/null; then
+        log_info "Stopping MySQL server..."
+        kill ${MYSQLD_PID} 2>/dev/null || true
+        wait ${MYSQLD_PID} 2>/dev/null || true
+    fi
+
+    log_info "Cleanup completed"
+    exit 130
+}
+
+trap trap_handler INT TERM
 
 # Set OOM score adjustment to protect hammerdbcli from OOM killer
 # log_info "Setting OOM score adjustment to -500 for hammerdbcli (PID: ${HAMMERDB_PID})..."
@@ -470,7 +506,7 @@ log_info "Benchmark running (HammerDB PID: ${HAMMERDB_PID}, MySQL PID: ${MYSQLD_
 log_info "Results directory: ${RESULTS_DIR}"
 
 START_TIME=$(date +%s)
-END_TIME=$((START_TIME + BENCHMARK_DURATION_HOURS * 3600))
+END_TIME=$((START_TIME + TOTAL_DURATION_MINUTES * 60))
 
 DATE_TIME=$(date +%Y%m%d_%H%M%S)
 FILE_PREFIX="${THP_ENABLED}_${ALLOCATOR}"
@@ -614,9 +650,13 @@ collect_rss_data() {
             log_error "mysqld RSS: $((MYSQLD_RSS / 1024 / 1024)) GB, hammerdbcli RSS: $((HAMMERDB_RSS / 1024 / 1024)) GB"
             log_error "Terminating benchmark due to memory limit exceeded"
 
-            # Kill processes (only if PID variables are set)
+            # Gracefully stop HammerDB first (allow it to write summary)
+            log_info "Sending graceful stop signal (SIGINT) to HammerDB..."
+            kill -INT ${hammerdb_pid} 2>/dev/null || true
+            sleep 5  # Give HammerDB time to write summary and profile
+
+            # Then stop other processes
             kill ${mysqld_pid} 2>/dev/null || true
-            kill ${hammerdb_pid} 2>/dev/null || true
             [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
             [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
             [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
@@ -741,6 +781,23 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         LAST_REPORT=$ELAPSED
     fi
 
+    # Gracefully stop HammerDB after 3 minutes to simulate unexpected stop
+    # if [ $ELAPSED -ge 180 ]; then
+    #     log_warn "Simulating unexpected stop: 3 minutes elapsed, stopping HammerDB..."
+    #     if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
+    #         log_info "Stopping HammerDB and all its child processes..."
+    #         # Kill the entire process group to ensure all HammerDB processes are terminated
+    #         pkill -TERM -P ${HAMMERDB_PID} 2>/dev/null || true
+    #         kill -TERM ${HAMMERDB_PID} 2>/dev/null || true
+    #         sleep 10
+    #         # Force kill if still running
+    #         pkill -KILL -P ${HAMMERDB_PID} 2>/dev/null || true
+    #         kill -KILL ${HAMMERDB_PID} 2>/dev/null || true
+    #         log_info "HammerDB stopped"
+    #         break
+    #     fi
+    # fi
+
     sleep 1
 done
 
@@ -768,6 +825,17 @@ log_info "Stopping MySQL server..."
 kill ${MYSQLD_PID} 2>/dev/null || true
 wait ${MYSQLD_PID} 2>/dev/null || true
 
+# Copy HammerDB transaction profile log if it exists
+HDBXTPROFILE_SRC="/tmp/hdbxtprofile.log"
+if [ -f "${HDBXTPROFILE_SRC}" ]; then
+    HDBXTPROFILE_DEST="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
+    log_info "Copying HammerDB transaction profile log..."
+    cp "${HDBXTPROFILE_SRC}" "${HDBXTPROFILE_DEST}"
+    log_info "  - HammerDB profile: ${HDBXTPROFILE_DEST}"
+else
+    log_warn "HammerDB transaction profile log not found at: ${HDBXTPROFILE_SRC}"
+fi
+
 # Summary
 log_info "======================================"
 log_info "Benchmark Summary"
@@ -778,7 +846,9 @@ log_info "THP enabled: ${THP_ENABLED}"
 log_info "Buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
 log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
-log_info "Duration: ${BENCHMARK_DURATION_HOURS} hours"
+log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
+log_info "Benchmark duration: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
+log_info "Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
 log_info "Results directory: ${RESULTS_DIR}"
 log_info "  - HammerDB output: ${HAMMERDB_OUTPUT_FILE}"
 log_info "  - MySQL status data: ${STATUS_FILE}"
@@ -790,6 +860,9 @@ log_info "  - RSS memory data: ${RSS_FILE}"
 log_info "  - MySQL global status data: ${GLOBAL_STATUS_FILE}"
 log_info "  - MySQL global variables data: ${GLOBAL_VARS_FILE}"
 log_info "  - vmstat system statistics: ${VMSTAT_FILE}"
+if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log" ]; then
+    log_info "  - HammerDB transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
+fi
 log_info "======================================"
 
 exit ${HAMMERDB_EXIT}

@@ -24,6 +24,8 @@ diset tpcc mysql_partition true
 
 diset tpcc mysql_count_ware 3000
 diset tpcc mysql_num_vu 80
+# diset tpcc mysql_count_ware 10
+# diset tpcc mysql_num_vu 10
 
 puts "SCHEMA BUILD STARTED"
 set ret [buildschema]
