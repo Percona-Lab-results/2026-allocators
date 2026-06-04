@@ -2,8 +2,12 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp_enabled> <allocator>
-# Example: ./run_hammerdb_benchmark.sh /opt/percona-server/bin/mysqld yes jemalloc53
+# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix>
+#
+# Examples:
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
@@ -37,25 +41,18 @@ sudo killall mysqld 2>/dev/null || true
 sleep 2
 
 # Check command line arguments
-if [ $# -lt 4 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> [skip_init:skip|noskip] <suffix>"
+if [ $# -ne 6 ]; then
+    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix>"
+    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1"
     exit 1
 fi
 
 SERVER_BINARY="$1"
 THP_ENABLED="$2"
 ALLOCATOR="$3"
-
-# Handle optional skip_init parameter and required suffix
-if [ $# -eq 4 ]; then
-    # Only 4 args: suffix is 4th, skip_init defaults to "noskip"
-    SKIP_INIT="noskip"
-    RESULTS_SUFFIX="$4"
-else
-    # 5 args: skip_init is 4th, suffix is 5th
-    SKIP_INIT="$4"
-    RESULTS_SUFFIX="$5"
-fi
+SKIP_INIT="$4"
+BUFFER_POOL_SIZE_GB="$5"
+RESULTS_SUFFIX="$6"
 
 # Set results directory with suffix
 RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}"
@@ -78,6 +75,12 @@ fi
 
 if [[ ! "${SKIP_INIT}" =~ ^(skip|noskip)$ ]]; then
     log_error "Skip init parameter must be 'skip' or 'noskip', got: ${SKIP_INIT}"
+    exit 1
+fi
+
+# Validate buffer pool size is a positive integer
+if ! [[ "${BUFFER_POOL_SIZE_GB}" =~ ^[0-9]+$ ]] || [ "${BUFFER_POOL_SIZE_GB}" -lt 1 ]; then
+    log_error "Buffer pool size must be a positive integer (in GB), got: ${BUFFER_POOL_SIZE_GB}"
     exit 1
 fi
 
@@ -127,7 +130,9 @@ done
 
 # 3. Create Server configuration file my.cnf
 log_info "Creating MySQL configuration file: ${MY_CNF}"
-cat > "${MY_CNF}" <<'EOF'
+log_info "InnoDB buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
+
+cat > "${MY_CNF}" <<EOF
 [mysqld]
 # Server configuration for HammerDB TPC-C benchmark
 
@@ -143,8 +148,8 @@ innodb_redo_log_capacity = 32G
 # Minimize flush overhead (not crash-safe, but optimal for testing)
 innodb_flush_log_at_trx_commit = 0
 
-# Memory configuration to target 110 GB buffer pool
-innodb_buffer_pool_size = 110G
+# Memory configuration
+innodb_buffer_pool_size = ${BUFFER_POOL_SIZE_GB}G
 innodb_buffer_pool_instances = 16
 innodb_max_dirty_pages_pct = 50
 innodb_io_capacity = 20000
@@ -161,11 +166,11 @@ innodb_doublewrite = OFF
 default-storage-engine = InnoDB
 
 # Logging
-log-error = ERROR_LOG_PLACEHOLDER
-pid-file = PID_FILE_PLACEHOLDER
+log-error = ${SERVER_DATA_DIR}/mysql-error.log
+pid-file = ${SERVER_DATA_DIR}/mysql.pid
 
 # Socket
-socket = SOCKET_PLACEHOLDER
+socket = ${MYSQL_SOCKET}
 
 # Disable SSL requirement
 require_secure_transport = OFF
@@ -173,12 +178,6 @@ require_secure_transport = OFF
 # Other settings
 sql_mode = ""
 EOF
-
-# Replace placeholders
-sed -i "s|DATA_DIR_PLACEHOLDER|${SERVER_DATA_DIR}|g" "${MY_CNF}"
-sed -i "s|ERROR_LOG_PLACEHOLDER|${SERVER_DATA_DIR}/mysql-error.log|g" "${MY_CNF}"
-sed -i "s|PID_FILE_PLACEHOLDER|${SERVER_DATA_DIR}/mysql.pid|g" "${MY_CNF}"
-sed -i "s|SOCKET_PLACEHOLDER|${MYSQL_SOCKET}|g" "${MY_CNF}"
 
 # 5.1. Add large-pages=ON if THP is enabled
 if [ "${THP_ENABLED}" = "thp" ]; then
@@ -765,6 +764,7 @@ log_info "======================================"
 log_info "Server binary: ${SERVER_BINARY}"
 log_info "Allocator: ${ALLOCATOR}"
 log_info "THP enabled: ${THP_ENABLED}"
+log_info "Buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
 log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
 log_info "Duration: ${BENCHMARK_DURATION_HOURS} hours"
