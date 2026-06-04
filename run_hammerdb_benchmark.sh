@@ -236,6 +236,17 @@ elif [ "${ALLOCATOR}" = "jemalloc53" ]; then
         log_error "Install with: sudo apt-get install libjemalloc2"
         exit 1
     fi
+elif [ "${ALLOCATOR}" = "tcmalloc" ]; then
+    TCMALLOC_LIB="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
+
+    if [ -f "${TCMALLOC_LIB}" ]; then
+        export LD_PRELOAD="${TCMALLOC_LIB}"
+        log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
+    else
+        log_error "tcmalloc library not found at: ${TCMALLOC_LIB}"
+        log_error "Install with: sudo apt-get install libgoogle-perftools-dev"
+        exit 1
+    fi
 fi
 
 # Start MySQL server
