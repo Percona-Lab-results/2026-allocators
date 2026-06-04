@@ -137,7 +137,7 @@ cat > "${MY_CNF}" <<EOF
 # Server configuration for HammerDB TPC-C benchmark
 
 # Data directory
-datadir=DATA_DIR_PLACEHOLDER
+datadir=${SERVER_DATA_DIR}
 
 # Disable binary logging
 skip-log-bin
