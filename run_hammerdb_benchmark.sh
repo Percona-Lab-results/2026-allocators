@@ -155,7 +155,6 @@ innodb_flush_log_at_trx_commit = 0
 # Memory configuration
 innodb_buffer_pool_size = ${BUFFER_POOL_SIZE_GB}G
 innodb_buffer_pool_instances = 16
-innodb_max_dirty_pages_pct = 50
 innodb_io_capacity = 20000
 
 # Connection settings
@@ -181,6 +180,8 @@ require_secure_transport = OFF
 
 # Other settings
 sql_mode = ""
+wait_timeout = 288000        # 80 hours
+interactive_timeout = 288000 # 80 hours  
 EOF
 
 # 5.1. Add large-pages=ON if THP is enabled
