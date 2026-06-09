@@ -7,6 +7,8 @@ Parses *_global_status_*.log files and calculates QPS from Questions and Uptime.
 import os
 import re
 import glob
+import sys
+import argparse
 from pathlib import Path
 from collections import defaultdict
 import json
@@ -93,20 +95,19 @@ def calculate_qps(snapshots):
     return qps_data
 
 
-def find_global_status_logs(base_dir):
+def find_global_status_logs(data_dir):
     """
-    Find all *_global_status_*.log files in mem-results subdirectories.
+    Find all *_global_status_*.log files in subdirectories.
     Returns a dict: {result_dir_name: log_file_path}
     """
     results = {}
-    mem_results_dir = os.path.join(base_dir, 'mem-results')
 
-    if not os.path.exists(mem_results_dir):
+    if not os.path.exists(data_dir):
         return results
 
     # Find all results-* directories
-    for entry in os.listdir(mem_results_dir):
-        result_dir = os.path.join(mem_results_dir, entry)
+    for entry in os.listdir(data_dir):
+        result_dir = os.path.join(data_dir, entry)
 
         # Skip non-directories and .tar.gz files
         if not os.path.isdir(result_dir):
@@ -123,20 +124,19 @@ def find_global_status_logs(base_dir):
     return results
 
 
-def find_rss_memory_logs(base_dir):
+def find_rss_memory_logs(data_dir):
     """
-    Find all *_rss_memory_*.log files in mem-results subdirectories.
+    Find all *_rss_memory_*.log files in subdirectories.
     Returns a dict: {result_dir_name: log_file_path}
     """
     results = {}
-    mem_results_dir = os.path.join(base_dir, 'mem-results')
 
-    if not os.path.exists(mem_results_dir):
+    if not os.path.exists(data_dir):
         return results
 
     # Find all results-* directories
-    for entry in os.listdir(mem_results_dir):
-        result_dir = os.path.join(mem_results_dir, entry)
+    for entry in os.listdir(data_dir):
+        result_dir = os.path.join(data_dir, entry)
 
         # Skip non-directories and .tar.gz files
         if not os.path.isdir(result_dir):
@@ -780,10 +780,57 @@ def generate_html_report(qps_results, rss_results, output_file):
 
 
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Generate HTML report with QPS and RSS memory graphs from HammerDB benchmark results.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s mem-results qps_report.html
+  %(prog)s /path/to/results my_report.html
+  %(prog)s                                    # Uses default: mem-results/ and qps_report.html
+        '''
+    )
+    parser.add_argument(
+        'data_dir',
+        nargs='?',
+        default='mem-results',
+        help='Directory containing result subdirectories (default: mem-results)'
+    )
+    parser.add_argument(
+        'output_file',
+        nargs='?',
+        default='qps_report.html',
+        help='Output HTML file name (default: qps_report.html)'
+    )
+
+    args = parser.parse_args()
+
+    # Resolve paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # If data_dir is relative, resolve it relative to script directory
+    if not os.path.isabs(args.data_dir):
+        data_dir = os.path.join(script_dir, args.data_dir)
+    else:
+        data_dir = args.data_dir
+
+    # If output_file is relative, resolve it relative to script directory
+    if not os.path.isabs(args.output_file):
+        output_file = os.path.join(script_dir, args.output_file)
+    else:
+        output_file = args.output_file
+
+    print(f"Data directory: {data_dir}")
+    print(f"Output file: {output_file}")
+    print()
+
+    if not os.path.exists(data_dir):
+        print(f"Error: Data directory does not exist: {data_dir}")
+        sys.exit(1)
 
     print("Searching for global status log files...")
-    log_files = find_global_status_logs(base_dir)
+    log_files = find_global_status_logs(data_dir)
 
     if not log_files:
         print("No global status log files found in mem-results subdirectories.")
@@ -821,7 +868,7 @@ def main():
     # Process RSS memory logs
     print("\n" + "="*60)
     print("Searching for RSS memory log files...")
-    rss_log_files = find_rss_memory_logs(base_dir)
+    rss_log_files = find_rss_memory_logs(data_dir)
     print(f"Found {len(rss_log_files)} result directories with RSS memory logs.")
 
     rss_results = {}
@@ -842,7 +889,6 @@ def main():
 
             rss_results[dir_name] = rss_data
 
-    output_file = os.path.join(base_dir, 'qps_report.html')
     print(f"\nGenerating HTML report: {output_file}")
     generate_html_report(qps_results, rss_results, output_file)
     print(f"Report generated successfully!")
