@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog>
+# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog> <storage_engine:innodb|myrocks>
 #
 # Examples:
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2 binlog
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3 nobinlog
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog innodb
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2 binlog innodb
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3 nobinlog myrocks
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
@@ -45,9 +45,9 @@ sudo killall mysqld 2>/dev/null || true
 sleep 2
 
 # Check command line arguments
-if [ $# -ne 7 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog>"
-    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog"
+if [ $# -ne 8 ]; then
+    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog> <storage_engine:innodb|myrocks>"
+    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog innodb"
     exit 1
 fi
 
@@ -58,9 +58,10 @@ SKIP_INIT="$4"
 BUFFER_POOL_SIZE_GB="$5"
 RESULTS_SUFFIX="$6"
 ENABLE_BINLOG="$7"
+STORAGE_ENGINE="$8"
 
 # Set results directory with suffix and parameters
-RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}"
+RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}-${STORAGE_ENGINE}"
 
 # Validate inputs
 if [ ! -f "${SERVER_BINARY}" ]; then
@@ -91,6 +92,11 @@ fi
 
 if [[ ! "${ENABLE_BINLOG}" =~ ^(binlog|nobinlog)$ ]]; then
     log_error "Enable binlog parameter must be 'binlog' or 'nobinlog', got: ${ENABLE_BINLOG}"
+    exit 1
+fi
+
+if [[ ! "${STORAGE_ENGINE}" =~ ^(innodb|myrocks)$ ]]; then
+    log_error "Storage engine parameter must be 'innodb' or 'myrocks', got: ${STORAGE_ENGINE}"
     exit 1
 fi
 
@@ -140,7 +146,7 @@ done
 
 # 3. Create Server configuration file my.cnf
 log_info "Creating MySQL configuration file: ${MY_CNF}"
-log_info "InnoDB buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
+log_info "Storage engine: ${STORAGE_ENGINE}"
 log_info "Binary logging: ${ENABLE_BINLOG}"
 
 cat > "${MY_CNF}" <<EOF
@@ -170,27 +176,8 @@ EOF
 fi
 
 cat >> "${MY_CNF}" <<EOF
-# InnoDB redo log configuration
-innodb_redo_log_capacity = 32G
-
-# Minimize flush overhead (not crash-safe, but optimal for testing)
-innodb_flush_log_at_trx_commit = 0
-
-# Memory configuration
-innodb_buffer_pool_size = ${BUFFER_POOL_SIZE_GB}G
-innodb_buffer_pool_instances = 16
-innodb_io_capacity = 20000
-
 # Connection settings
 max_connections = 200
-
-# Performance optimizations
-innodb_flush_method = O_DIRECT
-innodb_log_buffer_size = 256M
-innodb_doublewrite = OFF
-
-# Table settings
-default-storage-engine = InnoDB
 
 # Logging
 log-error = ${SERVER_DATA_DIR}/mysql-error.log
@@ -208,10 +195,71 @@ wait_timeout = 288000        # 80 hours
 interactive_timeout = 288000 # 80 hours
 EOF
 
+# Storage engine configuration
+if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+    log_info "Configuring MyRocks as default storage engine"
+    log_info "RocksDB block cache size: ${BUFFER_POOL_SIZE_GB}G"
+    cat >> "${MY_CNF}" <<EOF
+
+# MyRocks storage engine
+plugin-load=rocksdb=ha_rocksdb.so;rocksdb_cfstats=ha_rocksdb.so;rocksdb_dbstats=ha_rocksdb.so;rocksdb_perf_context=ha_rocksdb.so;rocksdb_perf_context_global=ha_rocksdb.so;rocksdb_cf_options=ha_rocksdb.so;rocksdb_compaction_stats=ha_rocksdb.so;rocksdb_global_info=ha_rocksdb.so;rocksdb_ddl=ha_rocksdb.so;rocksdb_index_file_map=ha_rocksdb.so;rocksdb_locks=ha_rocksdb.so;rocksdb_trx=ha_rocksdb.so
+default-storage-engine = ROCKSDB
+rocksdb_block_cache_size = ${BUFFER_POOL_SIZE_GB}G
+rocksdb_max_open_files=-1
+rocksdb_max_background_jobs=8
+rocksdb_max_total_wal_size=4G
+rocksdb_block_size=16384
+rocksdb_table_cache_numshardbits=6
+
+# rate limiter
+rocksdb_bytes_per_sync=16777216
+rocksdb_wal_bytes_per_sync=4194304
+
+rocksdb_compaction_sequential_deletes_count_sd=1
+rocksdb_compaction_sequential_deletes=199999
+rocksdb_compaction_sequential_deletes_window=200000
+
+rocksdb_default_cf_options="write_buffer_size=256m;target_file_size_base=32m;max_bytes_for_level_base=512m;max_write_buffer_number=4;level0_file_num_compaction_trigger=4;level0_slowdown_writes_trigger=20;level0_stop_writes_trigger=30;max_write_buffer_number=4;block_based_table_factory={cache_index_and_filter_blocks=1;filter_policy=bloomfilter:10:false;whole_key_filtering=0};level_compaction_dynamic_level_bytes=true;optimize_filters_for_hits=true;memtable_prefix_bloom_size_ratio=0.05;prefix_extractor=capped:12;compaction_pri=kMinOverlappingRatio;compression=kLZ4Compression;bottommost_compression=kLZ4Compression;compression_opts=-14:4:0"
+
+rocksdb_max_subcompactions=4
+rocksdb_compaction_readahead_size=16m
+
+rocksdb_use_direct_reads=ON
+rocksdb_use_direct_io_for_flush_and_compaction=ON
+EOF
+else
+    log_info "InnoDB buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
+    cat >> "${MY_CNF}" <<EOF
+
+# Table settings
+default-storage-engine = InnoDB
+
+# InnoDB redo log configuration
+innodb_redo_log_capacity = 32G
+
+# Minimize flush overhead (not crash-safe, but optimal for testing)
+innodb_flush_log_at_trx_commit = 0
+
+# Memory configuration
+innodb_buffer_pool_size = ${BUFFER_POOL_SIZE_GB}G
+innodb_buffer_pool_instances = 16
+innodb_io_capacity = 20000
+
+# Performance optimizations
+innodb_flush_method = O_DIRECT
+innodb_log_buffer_size = 256M
+innodb_doublewrite = OFF
+EOF
+fi
+
 # 5.1. Add large-pages=ON if THP is enabled
 if [ "${THP_ENABLED}" = "thp" ]; then
     log_info "Transparent Huge Pages enabled - adding large-pages=ON to my.cnf"
-    sed -i '/innodb_buffer_pool_instances = 16/a\\n# Transparent Huge Pages\nlarge-pages = ON' "${MY_CNF}"
+    cat >> "${MY_CNF}" <<EOF
+
+# Transparent Huge Pages
+large-pages = ON
+EOF
 fi
 
 log_info "Configuration file created successfully"
@@ -228,11 +276,16 @@ if [ "${SKIP_INIT}" = "noskip" ]; then
 
     # Initialize data directory
     log_info "Initializing MySQL data directory..."
-    "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
-     --innodb_flush_log_at_trx_commit=0 \
-     --innodb_doublewrite=0 \
-     --sync_binlog=0 \
-     --innodb_buffer_pool_size=1G
+    if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+        "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
+         --sync_binlog=0
+    else
+        "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
+         --innodb_flush_log_at_trx_commit=0 \
+         --innodb_doublewrite=0 \
+         --sync_binlog=0 \
+         --innodb_buffer_pool_size=1G
+    fi
 else
     log_info "Skipping initialization - using existing data directory: ${SERVER_DATA_DIR}"
     if [ ! -d "${SERVER_DATA_DIR}" ]; then
@@ -888,6 +941,7 @@ log_info "Allocator: ${ALLOCATOR}"
 log_info "THP enabled: ${THP_ENABLED}"
 log_info "Buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
 log_info "Binary logging: ${ENABLE_BINLOG}"
+log_info "Storage engine: ${STORAGE_ENGINE}"
 log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
 log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
