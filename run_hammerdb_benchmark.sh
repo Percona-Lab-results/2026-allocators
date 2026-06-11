@@ -264,6 +264,21 @@ fi
 
 log_info "Configuration file created successfully"
 
+# Build LD_LIBRARY_PATH prefix for mysqld (MyRocks needs lib/private for abseil/protobuf)
+MYSQLD_LD_LIBRARY_PATH=""
+if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+    SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
+    PRIVATE_LIB_DIR="${SERVER_DIR}/lib/private"
+
+    if [ ! -d "${PRIVATE_LIB_DIR}" ]; then
+        log_error "MyRocks requires private library directory: ${PRIVATE_LIB_DIR}"
+        exit 1
+    fi
+
+    MYSQLD_LD_LIBRARY_PATH="${PRIVATE_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    log_info "mysqld LD_LIBRARY_PATH: ${MYSQLD_LD_LIBRARY_PATH}"
+fi
+
 # 4. Remove old server data directory and create fresh one
 if [ "${SKIP_INIT}" = "noskip" ]; then
     if [ -d "${SERVER_DATA_DIR}" ]; then
@@ -276,8 +291,13 @@ if [ "${SKIP_INIT}" = "noskip" ]; then
 
     # Initialize data directory
     log_info "Initializing MySQL data directory..."
-    "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
-     --datadir="${SERVER_DATA_DIR}"
+    if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
+        LD_LIBRARY_PATH="${MYSQLD_LD_LIBRARY_PATH}" "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
+         --datadir="${SERVER_DATA_DIR}"
+    else
+        "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
+         --datadir="${SERVER_DATA_DIR}"
+    fi
 else
     log_info "Skipping initialization - using existing data directory: ${SERVER_DATA_DIR}"
     if [ ! -d "${SERVER_DATA_DIR}" ]; then
@@ -320,21 +340,6 @@ elif [ "${ALLOCATOR}" = "tcmalloc" ]; then
         log_error "Install with: sudo apt-get install libgoogle-perftools-dev"
         exit 1
     fi
-fi
-
-# Build LD_LIBRARY_PATH prefix for mysqld (MyRocks needs lib/private for abseil/protobuf)
-MYSQLD_LD_LIBRARY_PATH=""
-if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
-    SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
-    PRIVATE_LIB_DIR="${SERVER_DIR}/lib/private"
-
-    if [ ! -d "${PRIVATE_LIB_DIR}" ]; then
-        log_error "MyRocks requires private library directory: ${PRIVATE_LIB_DIR}"
-        exit 1
-    fi
-
-    MYSQLD_LD_LIBRARY_PATH="${PRIVATE_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    log_info "mysqld LD_LIBRARY_PATH: ${MYSQLD_LD_LIBRARY_PATH}"
 fi
 
 # Start MySQL server
