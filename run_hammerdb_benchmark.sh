@@ -133,6 +133,15 @@ if [ ! -f "${HAMMERDB_LOAD_TCL}" ]; then
     exit 1
 fi
 
+# Patch hammerdb_load.tcl to match the requested storage engine
+if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+    HAMMERDB_ENGINE="rocksdb"
+else
+    HAMMERDB_ENGINE="innodb"
+fi
+log_info "Setting hammerdb_load.tcl mysql_storage_engine to: ${HAMMERDB_ENGINE}"
+sed -i -E "s/^([[:space:]]*diset[[:space:]]+tpcc[[:space:]]+mysql_storage_engine[[:space:]]+).*/\1${HAMMERDB_ENGINE}/" "${HAMMERDB_LOAD_TCL}"
+
 # 2. Set CPU governor to performance mode and disable CPU idle state
 log_info "Setting CPU governor to performance mode..."
 sudo cpupower frequency-set -g performance 2>/dev/null || log_warn "Could not set CPU governor (cpupower not available or insufficient permissions)"
