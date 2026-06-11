@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix>
+# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog>
 #
 # Examples:
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2 binlog
+#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3 nobinlog
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
@@ -45,9 +45,9 @@ sudo killall mysqld 2>/dev/null || true
 sleep 2
 
 # Check command line arguments
-if [ $# -ne 6 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix>"
-    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1"
+if [ $# -ne 7 ]; then
+    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog>"
+    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog"
     exit 1
 fi
 
@@ -57,9 +57,10 @@ ALLOCATOR="$3"
 SKIP_INIT="$4"
 BUFFER_POOL_SIZE_GB="$5"
 RESULTS_SUFFIX="$6"
+ENABLE_BINLOG="$7"
 
 # Set results directory with suffix and parameters
-RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G"
+RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}"
 
 # Validate inputs
 if [ ! -f "${SERVER_BINARY}" ]; then
@@ -85,6 +86,11 @@ fi
 # Validate buffer pool size is a positive integer
 if ! [[ "${BUFFER_POOL_SIZE_GB}" =~ ^[0-9]+$ ]] || [ "${BUFFER_POOL_SIZE_GB}" -lt 1 ]; then
     log_error "Buffer pool size must be a positive integer (in GB), got: ${BUFFER_POOL_SIZE_GB}"
+    exit 1
+fi
+
+if [[ ! "${ENABLE_BINLOG}" =~ ^(binlog|nobinlog)$ ]]; then
+    log_error "Enable binlog parameter must be 'binlog' or 'nobinlog', got: ${ENABLE_BINLOG}"
     exit 1
 fi
 
@@ -135,6 +141,7 @@ done
 # 3. Create Server configuration file my.cnf
 log_info "Creating MySQL configuration file: ${MY_CNF}"
 log_info "InnoDB buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
+log_info "Binary logging: ${ENABLE_BINLOG}"
 
 cat > "${MY_CNF}" <<EOF
 [mysqld]
@@ -143,9 +150,26 @@ cat > "${MY_CNF}" <<EOF
 # Data directory
 datadir=${SERVER_DATA_DIR}
 
+EOF
+
+# Add binary logging configuration based on parameter
+if [ "${ENABLE_BINLOG}" = "binlog" ]; then
+    cat >> "${MY_CNF}" <<EOF
+# Binary logging enabled
+log-bin = ${SERVER_DATA_DIR}/mysql-bin
+sync_binlog = 1000
+server_id = 1
+
+EOF
+else
+    cat >> "${MY_CNF}" <<EOF
 # Disable binary logging
 skip-log-bin
 
+EOF
+fi
+
+cat >> "${MY_CNF}" <<EOF
 # InnoDB redo log configuration
 innodb_redo_log_capacity = 32G
 
@@ -181,7 +205,7 @@ require_secure_transport = OFF
 # Other settings
 sql_mode = ""
 wait_timeout = 288000        # 80 hours
-interactive_timeout = 288000 # 80 hours  
+interactive_timeout = 288000 # 80 hours
 EOF
 
 # 5.1. Add large-pages=ON if THP is enabled
@@ -857,6 +881,7 @@ log_info "Server binary: ${SERVER_BINARY}"
 log_info "Allocator: ${ALLOCATOR}"
 log_info "THP enabled: ${THP_ENABLED}"
 log_info "Buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
+log_info "Binary logging: ${ENABLE_BINLOG}"
 log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
 log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
