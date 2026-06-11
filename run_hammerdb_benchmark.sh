@@ -276,16 +276,8 @@ if [ "${SKIP_INIT}" = "noskip" ]; then
 
     # Initialize data directory
     log_info "Initializing MySQL data directory..."
-    if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
-        "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
-         --sync_binlog=0
-    else
-        "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --initialize-insecure --user=$(whoami) \
-         --innodb_flush_log_at_trx_commit=0 \
-         --innodb_doublewrite=0 \
-         --sync_binlog=0 \
-         --innodb_buffer_pool_size=1G
-    fi
+    "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
+     --datadir="${SERVER_DATA_DIR}"
 else
     log_info "Skipping initialization - using existing data directory: ${SERVER_DATA_DIR}"
     if [ ! -d "${SERVER_DATA_DIR}" ]; then
@@ -330,10 +322,30 @@ elif [ "${ALLOCATOR}" = "tcmalloc" ]; then
     fi
 fi
 
+# Build LD_LIBRARY_PATH prefix for mysqld (MyRocks needs lib/private for abseil/protobuf)
+MYSQLD_LD_LIBRARY_PATH=""
+if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+    SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
+    PRIVATE_LIB_DIR="${SERVER_DIR}/lib/private"
+
+    if [ ! -d "${PRIVATE_LIB_DIR}" ]; then
+        log_error "MyRocks requires private library directory: ${PRIVATE_LIB_DIR}"
+        exit 1
+    fi
+
+    MYSQLD_LD_LIBRARY_PATH="${PRIVATE_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    log_info "mysqld LD_LIBRARY_PATH: ${MYSQLD_LD_LIBRARY_PATH}"
+fi
+
 # Start MySQL server
 log_info "Starting MySQL server..."
-log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
-"${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
+if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
+    log_info "Command: LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH} ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+    LD_LIBRARY_PATH="${MYSQLD_LD_LIBRARY_PATH}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
+else
+    log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+    "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
+fi
 MYSQLD_PID=$!
 
 # Set OOM score adjustment to protect mysqld from OOM killer
