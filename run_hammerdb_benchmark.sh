@@ -859,8 +859,14 @@ HAMMERDB_EXIT=$?
 
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
-# MySQL server left running (PID: ${MYSQLD_PID})
-log_info "MySQL server left running (PID: ${MYSQLD_PID})"
+# Stop MySQL server
+log_info "Stopping MySQL server (PID: ${MYSQLD_PID})..."
+if kill -0 ${MYSQLD_PID} 2>/dev/null; then
+    kill -9 ${MYSQLD_PID} 2>/dev/null || true
+    log_info "MySQL server killed"
+else
+    log_info "MySQL server already stopped"
+fi
 
 # Copy HammerDB transaction profile log if it exists
 HDBXTPROFILE_SRC="/tmp/hdbxtprofile.log"
