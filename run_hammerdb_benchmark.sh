@@ -39,6 +39,10 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} [${timestamp}] $1"
 }
 
+# Raise open files limit for mysqld and hammerdb
+log_info "Setting open files limit (ulimit -n 65536)..."
+ulimit -n 65536
+
 # Kill any existing mysqld processes
 log_info "Killing any existing mysqld processes..."
 sudo killall mysqld 2>/dev/null || true
@@ -598,6 +602,8 @@ trap_handler() {
     [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
     [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
     [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+    [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
+    [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
 
     # Stop MySQL
     if kill -0 ${MYSQLD_PID} 2>/dev/null; then
@@ -637,6 +643,8 @@ RSS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_rss_memory_${DATE_TIME}.log"
 GLOBAL_STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_status_${DATE_TIME}.log"
 GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
 VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
+IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
+MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -675,6 +683,14 @@ echo "" >> "${GLOBAL_VARS_FILE}"
 echo "# vmstat system statistics (every 1 second)" > "${VMSTAT_FILE}"
 echo "# Started at: $(date)" >> "${VMSTAT_FILE}"
 echo "" >> "${VMSTAT_FILE}"
+
+echo "# iostat extended disk statistics (every 1 second)" > "${IOSTAT_FILE}"
+echo "# Started at: $(date)" >> "${IOSTAT_FILE}"
+echo "" >> "${IOSTAT_FILE}"
+
+echo "# mpstat per-CPU statistics (every 1 second)" > "${MPSTAT_FILE}"
+echo "# Started at: $(date)" >> "${MPSTAT_FILE}"
+echo "" >> "${MPSTAT_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -778,6 +794,8 @@ collect_rss_data() {
             [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
             [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
             [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+            [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
+            [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
 
             exit 1
         fi
@@ -838,11 +856,47 @@ collect_vmstat() {
     kill ${vmstat_pid} 2>/dev/null || true
 }
 
+# iostat disk statistics monitoring function
+collect_iostat() {
+    local iostat_file=$1
+    local mysqld_pid=$2
+    local hammerdb_pid=$3
+
+    # iostat -x: extended stats, -t: timestamp, -m: MB/s, 1s interval
+    iostat -xtm 1 > "${iostat_file}" 2>&1 &
+    local iostat_pid=$!
+
+    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        sleep 5
+    done
+
+    kill ${iostat_pid} 2>/dev/null || true
+}
+
+# mpstat per-CPU statistics monitoring function
+collect_mpstat() {
+    local mpstat_file=$1
+    local mysqld_pid=$2
+    local hammerdb_pid=$3
+
+    # mpstat -P ALL: all CPUs, 1s interval
+    mpstat -P ALL 1 > "${mpstat_file}" 2>&1 &
+    local mpstat_pid=$!
+
+    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        sleep 5
+    done
+
+    kill ${mpstat_pid} 2>/dev/null || true
+}
+
 # Initialize background process PIDs
 COLLECTOR_PID=""
 RSS_COLLECTOR_PID=""
 MYSQL_GLOBALS_PID=""
 VMSTAT_PID=""
+IOSTAT_PID=""
+MPSTAT_PID=""
 
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
@@ -859,6 +913,14 @@ MYSQL_GLOBALS_PID=$!
 # Start vmstat monitoring in background
 collect_vmstat "${VMSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
 VMSTAT_PID=$!
+
+# Start iostat monitoring in background
+collect_iostat "${IOSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+IOSTAT_PID=$!
+
+# Start mpstat monitoring in background
+collect_mpstat "${MPSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+MPSTAT_PID=$!
 
 # Time reporting loop
 LAST_REPORT=0
@@ -880,6 +942,8 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
         [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
         [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+        [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
+        [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
         exit 1
     fi
 
@@ -936,6 +1000,12 @@ HAMMERDB_EXIT=$?
 [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
 [ -n "${VMSTAT_PID}" ] && wait ${VMSTAT_PID} 2>/dev/null || true
 
+[ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
+[ -n "${IOSTAT_PID}" ] && wait ${IOSTAT_PID} 2>/dev/null || true
+
+[ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+[ -n "${MPSTAT_PID}" ] && wait ${MPSTAT_PID} 2>/dev/null || true
+
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
 # Stop MySQL server
@@ -984,6 +1054,8 @@ log_info "  - RSS memory data: ${RSS_FILE}"
 log_info "  - MySQL global status data: ${GLOBAL_STATUS_FILE}"
 log_info "  - MySQL global variables data: ${GLOBAL_VARS_FILE}"
 log_info "  - vmstat system statistics: ${VMSTAT_FILE}"
+log_info "  - iostat disk statistics: ${IOSTAT_FILE}"
+log_info "  - mpstat per-CPU statistics: ${MPSTAT_FILE}"
 if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log" ]; then
     log_info "  - HammerDB transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
 fi
