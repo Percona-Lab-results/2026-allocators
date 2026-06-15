@@ -223,6 +223,7 @@ if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
 # MyRocks storage engine
 plugin-load=rocksdb=ha_rocksdb.so;rocksdb_cfstats=ha_rocksdb.so;rocksdb_dbstats=ha_rocksdb.so;rocksdb_perf_context=ha_rocksdb.so;rocksdb_perf_context_global=ha_rocksdb.so;rocksdb_cf_options=ha_rocksdb.so;rocksdb_compaction_stats=ha_rocksdb.so;rocksdb_global_info=ha_rocksdb.so;rocksdb_ddl=ha_rocksdb.so;rocksdb_index_file_map=ha_rocksdb.so;rocksdb_locks=ha_rocksdb.so;rocksdb_trx=ha_rocksdb.so
 default-storage-engine = ROCKSDB
+transaction-isolation = READ-COMMITTED
 rocksdb_block_cache_size = ${BUFFER_POOL_SIZE_GB}G
 rocksdb_max_open_files=-1
 rocksdb_max_background_jobs=8
