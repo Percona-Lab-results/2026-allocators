@@ -14,9 +14,10 @@ SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
 MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
-BENCHMARK_DURATION_MINUTES=1200  # 20 hours = 1200 minutes
+BENCHMARK_DURATION_MINUTES=600  # 10 hours = 600 minutes
 RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
+WAIT_BETWEEN_RUNS_MINUTES=20     # Wait time between first and second run
 
 # Colors for output
 RED='\033[0;31m'
@@ -584,120 +585,147 @@ EOF
 TOTAL_DURATION_MINUTES=$((BENCHMARK_DURATION_MINUTES + RAMPUP_DURATION_MINUTES))
 BENCHMARK_DURATION_HOURS=$((BENCHMARK_DURATION_MINUTES / 60))
 TOTAL_DURATION_HOURS=$((TOTAL_DURATION_MINUTES / 60))
-log_info "Starting TPC-C benchmark: ${VIRTUAL_USERS} VUs"
-log_info "  Ramp-up: ${RAMPUP_DURATION_MINUTES} minutes"
-log_info "  Benchmark: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
-log_info "  Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
 
-# Start HammerDB in background
-HAMMERDB_OUTPUT_FILE="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output.log"
-"${HAMMERDB_CLI}" auto "${HAMMERDB_RUN_TCL}" > "${HAMMERDB_OUTPUT_FILE}" 2>&1 &
-HAMMERDB_PID=$!
+# Function to run a single benchmark iteration
+run_benchmark_iteration() {
+    local iteration=$1
+    local iteration_suffix=$2
 
-# Set up trap to gracefully stop HammerDB on script termination
-trap_handler() {
-    log_warn "Received termination signal, stopping benchmark gracefully..."
-    if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
-        log_info "Sending SIGINT to HammerDB (PID: ${HAMMERDB_PID}) to generate summary..."
-        kill -INT ${HAMMERDB_PID} 2>/dev/null || true
-        log_info "Waiting for HammerDB to finish writing summary..."
-        wait ${HAMMERDB_PID} 2>/dev/null || true
+    log_info "Starting TPC-C benchmark iteration ${iteration}: ${VIRTUAL_USERS} VUs"
+    log_info "  Ramp-up: ${RAMPUP_DURATION_MINUTES} minutes"
+    log_info "  Benchmark: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
+    log_info "  Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
+
+    # Start HammerDB in background
+    HAMMERDB_OUTPUT_FILE="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output${iteration_suffix}.log"
+    "${HAMMERDB_CLI}" auto "${HAMMERDB_RUN_TCL}" > "${HAMMERDB_OUTPUT_FILE}" 2>&1 &
+    HAMMERDB_PID=$!
+
+    # Set up trap to gracefully stop HammerDB on script termination
+    trap_handler() {
+        log_warn "Received termination signal, stopping benchmark gracefully..."
+        if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
+            log_info "Sending SIGINT to HammerDB (PID: ${HAMMERDB_PID}) to generate summary..."
+            kill -INT ${HAMMERDB_PID} 2>/dev/null || true
+            log_info "Waiting for HammerDB to finish writing summary..."
+            wait ${HAMMERDB_PID} 2>/dev/null || true
+        fi
+
+        # Stop data collectors
+        [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+        [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+        [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+        [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+        [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
+        [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+
+        # Stop MySQL
+        if kill -0 ${MYSQLD_PID} 2>/dev/null; then
+            log_info "Stopping MySQL server..."
+            kill ${MYSQLD_PID} 2>/dev/null || true
+            wait ${MYSQLD_PID} 2>/dev/null || true
+        fi
+
+        log_info "Cleanup completed"
+        exit 130
+    }
+
+    trap trap_handler INT TERM
+
+    # Set OOM score adjustment to protect hammerdbcli from OOM killer
+    # log_info "Setting OOM score adjustment to -500 for hammerdbcli (PID: ${HAMMERDB_PID})..."
+    # echo -500 | sudo tee /proc/${HAMMERDB_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment for hammerdbcli"
+
+    # 9. Print remaining time every 10 seconds
+    # 10. Collect /proc/<pid>/status every 1 second
+    # 11. Collect /proc/<pid>/smaps_rollup every 1 second
+
+    log_info "Benchmark iteration ${iteration} running (HammerDB PID: ${HAMMERDB_PID}, MySQL PID: ${MYSQLD_PID})"
+    log_info "Results directory: ${RESULTS_DIR}"
+
+    START_TIME=$(date +%s)
+    END_TIME=$((START_TIME + TOTAL_DURATION_MINUTES * 60))
+
+    # Time reporting loop
+    LAST_REPORT=0
+    while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
+        CURRENT_TIME=$(date +%s)
+        ELAPSED=$((CURRENT_TIME - START_TIME))
+        REMAINING=$((END_TIME - CURRENT_TIME))
+
+        if [ $REMAINING -lt 0 ]; then
+            REMAINING=0
+        fi
+
+        # Check if mysqld process is still alive
+        if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
+            log_error "mysqld process (PID: ${MYSQLD_PID}) has died unexpectedly!"
+            log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+            kill ${HAMMERDB_PID} 2>/dev/null || true
+            [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+            [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
+            [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
+            [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
+            [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
+            [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+            exit 1
+        fi
+
+        # Check if hammerdbcli process is still alive
+        if ! kill -0 ${HAMMERDB_PID} 2>/dev/null; then
+            log_error "hammerdbcli process (PID: ${HAMMERDB_PID}) has died unexpectedly!"
+            break
+        fi
+
+        # Report every 10 seconds
+        if [ $((ELAPSED - LAST_REPORT)) -ge 10 ]; then
+            HOURS=$((REMAINING / 3600))
+            MINUTES=$(((REMAINING % 3600) / 60))
+            SECONDS=$((REMAINING % 60))
+
+            log_info "Benchmark iteration ${iteration} progress (${RESULTS_SUFFIX}) - Time remaining: ${HOURS}h ${MINUTES}m ${SECONDS}s"
+            LAST_REPORT=$ELAPSED
+        fi
+
+        # Gracefully stop HammerDB after 3 minutes to simulate unexpected stop
+        # if [ $ELAPSED -ge 180 ]; then
+        #     log_warn "Simulating unexpected stop: 3 minutes elapsed, stopping HammerDB..."
+        #     if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
+        #         log_info "Stopping HammerDB and all its child processes..."
+        #         # Kill the entire process group to ensure all HammerDB processes are terminated
+        #         pkill -TERM -P ${HAMMERDB_PID} 2>/dev/null || true
+        #         kill -TERM ${HAMMERDB_PID} 2>/dev/null || true
+        #         sleep 10
+        #         # Force kill if still running
+        #         pkill -KILL -P ${HAMMERDB_PID} 2>/dev/null || true
+        #         kill -KILL ${HAMMERDB_PID} 2>/dev/null || true
+        #         log_info "HammerDB stopped"
+        #         break
+        #     fi
+        # fi
+
+        sleep 1
+    done
+
+    # Wait for HammerDB to complete
+    wait ${HAMMERDB_PID}
+    HAMMERDB_EXIT=$?
+
+    log_info "Benchmark iteration ${iteration} completed (exit code: ${HAMMERDB_EXIT})"
+
+    # Copy HammerDB transaction profile log if it exists
+    HDBXTPROFILE_SRC="/tmp/hdbxtprofile.log"
+    if [ -f "${HDBXTPROFILE_SRC}" ]; then
+        HDBXTPROFILE_DEST="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile${iteration_suffix}.log"
+        log_info "Copying HammerDB transaction profile log..."
+        cp "${HDBXTPROFILE_SRC}" "${HDBXTPROFILE_DEST}"
+        log_info "  - HammerDB profile: ${HDBXTPROFILE_DEST}"
+    else
+        log_warn "HammerDB transaction profile log not found at: ${HDBXTPROFILE_SRC}"
     fi
 
-    # Stop data collectors
-    [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
-    [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
-    [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
-    [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
-    [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
-    [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
-
-    # Stop MySQL
-    if kill -0 ${MYSQLD_PID} 2>/dev/null; then
-        log_info "Stopping MySQL server..."
-        kill ${MYSQLD_PID} 2>/dev/null || true
-        wait ${MYSQLD_PID} 2>/dev/null || true
-    fi
-
-    log_info "Cleanup completed"
-    exit 130
+    return ${HAMMERDB_EXIT}
 }
-
-trap trap_handler INT TERM
-
-# Set OOM score adjustment to protect hammerdbcli from OOM killer
-# log_info "Setting OOM score adjustment to -500 for hammerdbcli (PID: ${HAMMERDB_PID})..."
-# echo -500 | sudo tee /proc/${HAMMERDB_PID}/oom_score_adj > /dev/null || log_warn "Failed to set OOM score adjustment for hammerdbcli"
-
-# 9. Print remaining time every 10 seconds
-# 10. Collect /proc/<pid>/status every 1 second
-# 11. Collect /proc/<pid>/smaps_rollup every 1 second
-
-log_info "Benchmark running (HammerDB PID: ${HAMMERDB_PID}, MySQL PID: ${MYSQLD_PID})"
-log_info "Results directory: ${RESULTS_DIR}"
-
-START_TIME=$(date +%s)
-END_TIME=$((START_TIME + TOTAL_DURATION_MINUTES * 60))
-
-DATE_TIME=$(date +%Y%m%d_%H%M%S)
-FILE_PREFIX="${THP_ENABLED}_${ALLOCATOR}"
-STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_status_${DATE_TIME}.log"
-SMAPS_ROLLUP_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_rollup_${DATE_TIME}.log"
-SMAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_${DATE_TIME}.log"
-STAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_stat_${DATE_TIME}.log"
-MAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_maps_${DATE_TIME}.log"
-RSS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_rss_memory_${DATE_TIME}.log"
-GLOBAL_STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_status_${DATE_TIME}.log"
-GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
-VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
-IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
-MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
-
-# Add headers
-echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
-echo "# Started at: $(date)" >> "${STATUS_FILE}"
-echo "" >> "${STATUS_FILE}"
-
-echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection" > "${SMAPS_ROLLUP_FILE}"
-echo "# Started at: $(date)" >> "${SMAPS_ROLLUP_FILE}"
-echo "" >> "${SMAPS_ROLLUP_FILE}"
-
-echo "# MySQL /proc/${MYSQLD_PID}/smaps data collection (every 30 seconds)" > "${SMAPS_FILE}"
-echo "# Started at: $(date)" >> "${SMAPS_FILE}"
-echo "" >> "${SMAPS_FILE}"
-
-echo "# MySQL /proc/${MYSQLD_PID}/stat data collection" > "${STAT_FILE}"
-echo "# Started at: $(date)" >> "${STAT_FILE}"
-echo "" >> "${STAT_FILE}"
-
-echo "# MySQL /proc/${MYSQLD_PID}/maps data collection" > "${MAPS_FILE}"
-echo "# Started at: $(date)" >> "${MAPS_FILE}"
-echo "" >> "${MAPS_FILE}"
-
-echo "# RSS (Resident Memory Size) monitoring for mysqld and hammerdbcli" > "${RSS_FILE}"
-echo "# Started at: $(date)" >> "${RSS_FILE}"
-echo "# Format: Timestamp, mysqld_PID, mysqld_RSS_KB, hammerdbcli_PID, hammerdbcli_RSS_KB" >> "${RSS_FILE}"
-echo "" >> "${RSS_FILE}"
-
-echo "# MySQL SHOW GLOBAL STATUS data collection (every 30 seconds)" > "${GLOBAL_STATUS_FILE}"
-echo "# Started at: $(date)" >> "${GLOBAL_STATUS_FILE}"
-echo "" >> "${GLOBAL_STATUS_FILE}"
-
-echo "# MySQL SHOW GLOBAL VARIABLES data collection (every 30 seconds)" > "${GLOBAL_VARS_FILE}"
-echo "# Started at: $(date)" >> "${GLOBAL_VARS_FILE}"
-echo "" >> "${GLOBAL_VARS_FILE}"
-
-echo "# vmstat system statistics (every 1 second)" > "${VMSTAT_FILE}"
-echo "# Started at: $(date)" >> "${VMSTAT_FILE}"
-echo "" >> "${VMSTAT_FILE}"
-
-echo "# iostat extended disk statistics (every 1 second)" > "${IOSTAT_FILE}"
-echo "# Started at: $(date)" >> "${IOSTAT_FILE}"
-echo "" >> "${IOSTAT_FILE}"
-
-echo "# mpstat per-CPU statistics (every 1 second)" > "${MPSTAT_FILE}"
-echo "# Started at: $(date)" >> "${MPSTAT_FILE}"
-echo "" >> "${MPSTAT_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -710,7 +738,7 @@ collect_proc_data() {
 
     local iteration=0
 
-    while kill -0 ${pid} 2>/dev/null && kill -0 ${HAMMERDB_PID} 2>/dev/null; do
+    while kill -0 ${pid} 2>/dev/null; do
         TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 
         # Collect status (every 1 second)
@@ -758,10 +786,9 @@ collect_proc_data() {
 # RSS monitoring function
 collect_rss_data() {
     local mysqld_pid=$1
-    local hammerdb_pid=$2
-    local rss_file=$3
+    local rss_file=$2
 
-    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+    while kill -0 ${mysqld_pid} 2>/dev/null; do
         TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
 
         # Get RSS for mysqld (in KB)
@@ -771,15 +798,22 @@ collect_rss_data() {
             [ -z "${MYSQLD_RSS}" ] && MYSQLD_RSS=0
         fi
 
-        # Get RSS for hammerdbcli (in KB)
+        # Get RSS for all hammerdbcli processes (in KB)
         HAMMERDB_RSS=0
-        if [ -f "/proc/${hammerdb_pid}/status" ]; then
-            HAMMERDB_RSS=$(grep "^VmRSS:" /proc/${hammerdb_pid}/status 2>/dev/null | awk '{print $2}')
-            [ -z "${HAMMERDB_RSS}" ] && HAMMERDB_RSS=0
-        fi
+        HAMMERDB_PIDS=""
+        for pid in $(pgrep -f hammerdbcli 2>/dev/null || true); do
+            if [ -f "/proc/${pid}/status" ]; then
+                RSS=$(grep "^VmRSS:" /proc/${pid}/status 2>/dev/null | awk '{print $2}')
+                if [ -n "${RSS}" ]; then
+                    HAMMERDB_RSS=$((HAMMERDB_RSS + RSS))
+                    HAMMERDB_PIDS="${HAMMERDB_PIDS}${pid},"
+                fi
+            fi
+        done
+        HAMMERDB_PIDS="${HAMMERDB_PIDS%,}"  # Remove trailing comma
 
         # Write to log file in CSV format
-        echo "${TIMESTAMP}, ${mysqld_pid}, ${MYSQLD_RSS}, ${hammerdb_pid}, ${HAMMERDB_RSS}" >> "${rss_file}"
+        echo "${TIMESTAMP}, ${mysqld_pid}, ${MYSQLD_RSS}, ${HAMMERDB_PIDS}, ${HAMMERDB_RSS}" >> "${rss_file}"
 
         # Check if combined RSS exceeds 180GB  (188743680 KB)
         COMBINED_RSS=$((MYSQLD_RSS + HAMMERDB_RSS))
@@ -791,9 +825,11 @@ collect_rss_data() {
             log_error "mysqld RSS: $((MYSQLD_RSS / 1024 / 1024)) GB, hammerdbcli RSS: $((HAMMERDB_RSS / 1024 / 1024)) GB"
             log_error "Terminating benchmark due to memory limit exceeded"
 
-            # Gracefully stop HammerDB first (allow it to write summary)
-            log_info "Sending graceful stop signal (SIGINT) to HammerDB..."
-            kill -INT ${hammerdb_pid} 2>/dev/null || true
+            # Gracefully stop all HammerDB processes first
+            log_info "Sending graceful stop signal (SIGINT) to HammerDB processes..."
+            for pid in $(pgrep -f hammerdbcli 2>/dev/null || true); do
+                kill -INT ${pid} 2>/dev/null || true
+            done
             sleep 5  # Give HammerDB time to write summary and profile
 
             # Then stop other processes
@@ -818,11 +854,10 @@ collect_mysql_globals() {
     local global_status_file=$3
     local global_vars_file=$4
     local mysqld_pid=$5
-    local hammerdb_pid=$6
 
     local iteration=0
 
-    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+    while kill -0 ${mysqld_pid} 2>/dev/null; do
         # Collect every 30 seconds
         if [ $((iteration % 30)) -eq 0 ]; then
             TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
@@ -847,19 +882,18 @@ collect_mysql_globals() {
 collect_vmstat() {
     local vmstat_file=$1
     local mysqld_pid=$2
-    local hammerdb_pid=$3
 
     # Run vmstat 1 to get output every 1 second
     # The first line will be averages since boot, then real-time data
     vmstat -t 1 > "${vmstat_file}" 2>&1 &
     local vmstat_pid=$!
 
-    # Monitor and kill vmstat when benchmark stops
-    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+    # Monitor and kill vmstat when mysqld stops
+    while kill -0 ${mysqld_pid} 2>/dev/null; do
         sleep 5
     done
 
-    # Kill vmstat when benchmark is done
+    # Kill vmstat when mysqld is done
     kill ${vmstat_pid} 2>/dev/null || true
 }
 
@@ -867,13 +901,12 @@ collect_vmstat() {
 collect_iostat() {
     local iostat_file=$1
     local mysqld_pid=$2
-    local hammerdb_pid=$3
 
     # iostat -x: extended stats, -t: timestamp, -m: MB/s, 1s interval
     iostat -xtm 1 > "${iostat_file}" 2>&1 &
     local iostat_pid=$!
 
-    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+    while kill -0 ${mysqld_pid} 2>/dev/null; do
         sleep 5
     done
 
@@ -884,18 +917,78 @@ collect_iostat() {
 collect_mpstat() {
     local mpstat_file=$1
     local mysqld_pid=$2
-    local hammerdb_pid=$3
 
     # mpstat -P ALL: all CPUs, 1s interval
     mpstat -P ALL 1 > "${mpstat_file}" 2>&1 &
     local mpstat_pid=$!
 
-    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+    while kill -0 ${mysqld_pid} 2>/dev/null; do
         sleep 5
     done
 
     kill ${mpstat_pid} 2>/dev/null || true
 }
+
+# Initialize continuous data collection files (shared across both runs)
+DATE_TIME=$(date +%Y%m%d_%H%M%S)
+FILE_PREFIX="${THP_ENABLED}_${ALLOCATOR}"
+STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_status_${DATE_TIME}.log"
+SMAPS_ROLLUP_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_rollup_${DATE_TIME}.log"
+SMAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_smaps_${DATE_TIME}.log"
+STAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_stat_${DATE_TIME}.log"
+MAPS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_maps_${DATE_TIME}.log"
+RSS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_rss_memory_${DATE_TIME}.log"
+GLOBAL_STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_status_${DATE_TIME}.log"
+GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
+VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
+IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
+MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
+
+# Add headers to continuous monitoring files
+echo "# MySQL /proc/${MYSQLD_PID}/status data collection (continuous across both runs)" > "${STATUS_FILE}"
+echo "# Started at: $(date)" >> "${STATUS_FILE}"
+echo "" >> "${STATUS_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection (continuous across both runs)" > "${SMAPS_ROLLUP_FILE}"
+echo "# Started at: $(date)" >> "${SMAPS_ROLLUP_FILE}"
+echo "" >> "${SMAPS_ROLLUP_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/smaps data collection (every 30 seconds, continuous across both runs)" > "${SMAPS_FILE}"
+echo "# Started at: $(date)" >> "${SMAPS_FILE}"
+echo "" >> "${SMAPS_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/stat data collection (continuous across both runs)" > "${STAT_FILE}"
+echo "# Started at: $(date)" >> "${STAT_FILE}"
+echo "" >> "${STAT_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/maps data collection (continuous across both runs)" > "${MAPS_FILE}"
+echo "# Started at: $(date)" >> "${MAPS_FILE}"
+echo "" >> "${MAPS_FILE}"
+
+echo "# RSS (Resident Memory Size) monitoring for mysqld and hammerdbcli (continuous across both runs)" > "${RSS_FILE}"
+echo "# Started at: $(date)" >> "${RSS_FILE}"
+echo "# Format: Timestamp, mysqld_PID, mysqld_RSS_KB, hammerdbcli_PIDs, total_hammerdbcli_RSS_KB" >> "${RSS_FILE}"
+echo "" >> "${RSS_FILE}"
+
+echo "# MySQL SHOW GLOBAL STATUS data collection (every 30 seconds, continuous across both runs)" > "${GLOBAL_STATUS_FILE}"
+echo "# Started at: $(date)" >> "${GLOBAL_STATUS_FILE}"
+echo "" >> "${GLOBAL_STATUS_FILE}"
+
+echo "# MySQL SHOW GLOBAL VARIABLES data collection (every 30 seconds, continuous across both runs)" > "${GLOBAL_VARS_FILE}"
+echo "# Started at: $(date)" >> "${GLOBAL_VARS_FILE}"
+echo "" >> "${GLOBAL_VARS_FILE}"
+
+echo "# vmstat system statistics (every 1 second, continuous across both runs)" > "${VMSTAT_FILE}"
+echo "# Started at: $(date)" >> "${VMSTAT_FILE}"
+echo "" >> "${VMSTAT_FILE}"
+
+echo "# iostat extended disk statistics (every 1 second, continuous across both runs)" > "${IOSTAT_FILE}"
+echo "# Started at: $(date)" >> "${IOSTAT_FILE}"
+echo "" >> "${IOSTAT_FILE}"
+
+echo "# mpstat per-CPU statistics (every 1 second, continuous across both runs)" > "${MPSTAT_FILE}"
+echo "# Started at: $(date)" >> "${MPSTAT_FILE}"
+echo "" >> "${MPSTAT_FILE}"
 
 # Initialize background process PIDs
 COLLECTOR_PID=""
@@ -905,96 +998,77 @@ VMSTAT_PID=""
 IOSTAT_PID=""
 MPSTAT_PID=""
 
-# Start data collection in background
+log_info "Starting continuous data collectors..."
+
+# Start data collection in background (runs continuously for both benchmark iterations)
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
 COLLECTOR_PID=$!
 
 # Start RSS monitoring in background
-collect_rss_data ${MYSQLD_PID} ${HAMMERDB_PID} "${RSS_FILE}" &
+collect_rss_data ${MYSQLD_PID} "${RSS_FILE}" &
 RSS_COLLECTOR_PID=$!
 
 # Start MySQL global status/variables monitoring in background
-collect_mysql_globals "${MYSQL_CLIENT}" "${MYSQL_SOCKET}" "${GLOBAL_STATUS_FILE}" "${GLOBAL_VARS_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+collect_mysql_globals "${MYSQL_CLIENT}" "${MYSQL_SOCKET}" "${GLOBAL_STATUS_FILE}" "${GLOBAL_VARS_FILE}" ${MYSQLD_PID} &
 MYSQL_GLOBALS_PID=$!
 
 # Start vmstat monitoring in background
-collect_vmstat "${VMSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+collect_vmstat "${VMSTAT_FILE}" ${MYSQLD_PID} &
 VMSTAT_PID=$!
 
 # Start iostat monitoring in background
-collect_iostat "${IOSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+collect_iostat "${IOSTAT_FILE}" ${MYSQLD_PID} &
 IOSTAT_PID=$!
 
 # Start mpstat monitoring in background
-collect_mpstat "${MPSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+collect_mpstat "${MPSTAT_FILE}" ${MYSQLD_PID} &
 MPSTAT_PID=$!
 
-# Time reporting loop
-LAST_REPORT=0
-while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
-    CURRENT_TIME=$(date +%s)
-    ELAPSED=$((CURRENT_TIME - START_TIME))
-    REMAINING=$((END_TIME - CURRENT_TIME))
+log_info "Continuous data collectors started"
 
-    if [ $REMAINING -lt 0 ]; then
-        REMAINING=0
-    fi
+# Run first benchmark iteration
+log_info "======================================"
+log_info "Starting first benchmark run"
+log_info "======================================"
+run_benchmark_iteration 1 "_run1"
+FIRST_RUN_EXIT=$?
 
-    # Check if mysqld process is still alive
+# Wait 20 minutes before second run
+log_info "======================================"
+log_info "First run completed. Waiting ${WAIT_BETWEEN_RUNS_MINUTES} minutes before second run..."
+log_info "MySQL server remains running (PID: ${MYSQLD_PID})"
+log_info "======================================"
+
+WAIT_START=$(date +%s)
+WAIT_END=$((WAIT_START + WAIT_BETWEEN_RUNS_MINUTES * 60))
+
+while [ $(date +%s) -lt ${WAIT_END} ]; do
+    REMAINING=$((WAIT_END - $(date +%s)))
+    MINUTES=$((REMAINING / 60))
+    SECONDS=$((REMAINING % 60))
+
+    # Check if mysqld is still alive during wait
     if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
-        log_error "mysqld process (PID: ${MYSQLD_PID}) has died unexpectedly!"
+        log_error "mysqld process (PID: ${MYSQLD_PID}) has died during wait period!"
         log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
-        kill ${HAMMERDB_PID} 2>/dev/null || true
-        [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
-        [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
-        [ -n "${MYSQL_GLOBALS_PID}" ] && kill ${MYSQL_GLOBALS_PID} 2>/dev/null || true
-        [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
-        [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
-        [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
         exit 1
     fi
 
-    # Check if hammerdbcli process is still alive
-    if ! kill -0 ${HAMMERDB_PID} 2>/dev/null; then
-        log_error "hammerdbcli process (PID: ${HAMMERDB_PID}) has died unexpectedly!"
-        break
+    if [ $((REMAINING % 60)) -eq 0 ]; then
+        log_info "Waiting... ${MINUTES} minutes remaining"
     fi
-
-    # Report every 10 seconds
-    if [ $((ELAPSED - LAST_REPORT)) -ge 10 ]; then
-        HOURS=$((REMAINING / 3600))
-        MINUTES=$(((REMAINING % 3600) / 60))
-        SECONDS=$((REMAINING % 60))
-
-        log_info "Benchmark progress (${RESULTS_SUFFIX}) - Time remaining: ${HOURS}h ${MINUTES}m ${SECONDS}s"
-        LAST_REPORT=$ELAPSED
-    fi
-
-    # Gracefully stop HammerDB after 3 minutes to simulate unexpected stop
-    # if [ $ELAPSED -ge 180 ]; then
-    #     log_warn "Simulating unexpected stop: 3 minutes elapsed, stopping HammerDB..."
-    #     if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
-    #         log_info "Stopping HammerDB and all its child processes..."
-    #         # Kill the entire process group to ensure all HammerDB processes are terminated
-    #         pkill -TERM -P ${HAMMERDB_PID} 2>/dev/null || true
-    #         kill -TERM ${HAMMERDB_PID} 2>/dev/null || true
-    #         sleep 10
-    #         # Force kill if still running
-    #         pkill -KILL -P ${HAMMERDB_PID} 2>/dev/null || true
-    #         kill -KILL ${HAMMERDB_PID} 2>/dev/null || true
-    #         log_info "HammerDB stopped"
-    #         break
-    #     fi
-    # fi
-
-    sleep 1
+    sleep 10
 done
 
-# Wait for HammerDB to complete
-wait ${HAMMERDB_PID}
-HAMMERDB_EXIT=$?
+# Run second benchmark iteration
+log_info "======================================"
+log_info "Starting second benchmark run"
+log_info "======================================"
+run_benchmark_iteration 2 "_run2"
+SECOND_RUN_EXIT=$?
 
-# Stop data collection
+# Stop data collectors
+log_info "Stopping data collectors..."
 [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
 [ -n "${COLLECTOR_PID}" ] && wait ${COLLECTOR_PID} 2>/dev/null || true
 
@@ -1013,26 +1087,15 @@ HAMMERDB_EXIT=$?
 [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
 [ -n "${MPSTAT_PID}" ] && wait ${MPSTAT_PID} 2>/dev/null || true
 
-log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
+log_info "Data collectors stopped"
 
-# Stop MySQL server
+# Stop MySQL server after both runs
 log_info "Stopping MySQL server (PID: ${MYSQLD_PID})..."
 if kill -0 ${MYSQLD_PID} 2>/dev/null; then
     kill -9 ${MYSQLD_PID} 2>/dev/null || true
     log_info "MySQL server killed"
 else
     log_info "MySQL server already stopped"
-fi
-
-# Copy HammerDB transaction profile log if it exists
-HDBXTPROFILE_SRC="/tmp/hdbxtprofile.log"
-if [ -f "${HDBXTPROFILE_SRC}" ]; then
-    HDBXTPROFILE_DEST="${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
-    log_info "Copying HammerDB transaction profile log..."
-    cp "${HDBXTPROFILE_SRC}" "${HDBXTPROFILE_DEST}"
-    log_info "  - HammerDB profile: ${HDBXTPROFILE_DEST}"
-else
-    log_warn "HammerDB transaction profile log not found at: ${HDBXTPROFILE_SRC}"
 fi
 
 # Summary
@@ -1049,9 +1112,24 @@ log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
 log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
 log_info "Benchmark duration: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
-log_info "Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
+log_info "Total duration per run: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
+log_info "Wait between runs: ${WAIT_BETWEEN_RUNS_MINUTES} minutes"
+log_info "Number of runs: 2"
+log_info "First run exit code: ${FIRST_RUN_EXIT}"
+log_info "Second run exit code: ${SECOND_RUN_EXIT}"
 log_info "Results directory: ${RESULTS_DIR}"
-log_info "  - HammerDB output: ${HAMMERDB_OUTPUT_FILE}"
+log_info ""
+log_info "HammerDB run files:"
+log_info "  - Run 1 output: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output_run1.log"
+if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run1.log" ]; then
+    log_info "  - Run 1 transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run1.log"
+fi
+log_info "  - Run 2 output: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output_run2.log"
+if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run2.log" ]; then
+    log_info "  - Run 2 transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run2.log"
+fi
+log_info ""
+log_info "Continuous monitoring files (cover both runs and the wait period):"
 log_info "  - MySQL status data: ${STATUS_FILE}"
 log_info "  - MySQL smaps_rollup data: ${SMAPS_ROLLUP_FILE}"
 log_info "  - MySQL smaps data: ${SMAPS_FILE}"
@@ -1063,9 +1141,11 @@ log_info "  - MySQL global variables data: ${GLOBAL_VARS_FILE}"
 log_info "  - vmstat system statistics: ${VMSTAT_FILE}"
 log_info "  - iostat disk statistics: ${IOSTAT_FILE}"
 log_info "  - mpstat per-CPU statistics: ${MPSTAT_FILE}"
-if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log" ]; then
-    log_info "  - HammerDB transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
-fi
 log_info "======================================"
 
-exit ${HAMMERDB_EXIT}
+# Exit with non-zero if either run failed
+if [ ${FIRST_RUN_EXIT} -ne 0 ] || [ ${SECOND_RUN_EXIT} -ne 0 ]; then
+    exit 1
+else
+    exit 0
+fi
