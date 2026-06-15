@@ -179,6 +179,12 @@ log-bin = ${SERVER_DATA_DIR}/mysql-bin
 sync_binlog = 1000
 server_id = 1
 
+# Cap binlog retention: whichever limit fires first
+# 500G total binlog space, or 2 hours of history
+binlog_space_limit = 500G
+binlog_expire_logs_seconds = 3600
+
+
 EOF
 else
     cat >> "${MY_CNF}" <<EOF
