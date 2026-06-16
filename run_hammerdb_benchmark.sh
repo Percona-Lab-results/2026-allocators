@@ -289,6 +289,13 @@ EOF
 fi
 
 log_info "Configuration file created successfully"
+log_info ""
+log_info "========================================"
+log_info "Generated my.cnf contents:"
+log_info "========================================"
+cat "${MY_CNF}"
+log_info "========================================"
+log_info ""
 
 # Build LD_LIBRARY_PATH prefix for mysqld (MyRocks needs lib/private for abseil/protobuf)
 MYSQLD_LD_LIBRARY_PATH=""
@@ -321,9 +328,13 @@ if [ "${SKIP_INIT}" = "noskip" ]; then
     # Initialize data directory
     log_info "Initializing MySQL data directory: ${ABSOLUTE_DATA_DIR}"
     if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
+        log_info "INITIALIZATION COMMAND:"
+        log_info "  LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH} ${SERVER_BINARY} --no-defaults --initialize-insecure --user=$(whoami) --datadir=${ABSOLUTE_DATA_DIR}"
         LD_LIBRARY_PATH="${MYSQLD_LD_LIBRARY_PATH}" "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
          --datadir="${ABSOLUTE_DATA_DIR}"
     else
+        log_info "INITIALIZATION COMMAND:"
+        log_info "  ${SERVER_BINARY} --no-defaults --initialize-insecure --user=$(whoami) --datadir=${ABSOLUTE_DATA_DIR}"
         "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
          --datadir="${ABSOLUTE_DATA_DIR}"
     fi
@@ -409,10 +420,19 @@ echo "${MEMORY_HIGH_BYTES}" | sudo tee "${CGROUP_PATH}/memory.high" > /dev/null
 # Start MySQL server
 log_info "Starting MySQL server..."
 if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
-    log_info "Command: LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH} ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+    log_info "STARTUP COMMAND:"
+    log_info "  LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH}"
+    log_info "  LD_PRELOAD=${LD_PRELOAD:-<not set>}"
+    log_info "  ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+    log_info ""
+    log_info "Full command line: LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH} LD_PRELOAD=${LD_PRELOAD:-} ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
     LD_LIBRARY_PATH="${MYSQLD_LD_LIBRARY_PATH}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
 else
-    log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+    log_info "STARTUP COMMAND:"
+    log_info "  LD_PRELOAD=${LD_PRELOAD:-<not set>}"
+    log_info "  ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+    log_info ""
+    log_info "Full command line: LD_PRELOAD=${LD_PRELOAD:-} ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
     "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
 fi
 MYSQLD_PID=$!
