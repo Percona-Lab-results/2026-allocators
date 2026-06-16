@@ -362,6 +362,41 @@ elif [ "${ALLOCATOR}" = "tcmalloc" ]; then
     fi
 fi
 
+# Create cgroup for memory limiting (cgroups v2)
+CGROUP_NAME="mysql_benchmark_limit"
+CGROUP_PATH="/sys/fs/cgroup/${CGROUP_NAME}"
+MEMORY_LIMIT_GB=170
+MEMORY_LIMIT_BYTES=$((MEMORY_LIMIT_GB * 1024 * 1024 * 1024))
+
+log_info "Creating cgroup for memory limiting: ${CGROUP_PATH}"
+log_info "Memory limit: ${MEMORY_LIMIT_GB}GB (${MEMORY_LIMIT_BYTES} bytes)"
+
+# Check if cgroups v2 is available
+if [ ! -d "/sys/fs/cgroup" ]; then
+    log_error "cgroups v2 not available at /sys/fs/cgroup"
+    exit 1
+fi
+
+# Remove old cgroup if it exists
+if [ -d "${CGROUP_PATH}" ]; then
+    log_info "Removing existing cgroup: ${CGROUP_PATH}"
+    sudo rmdir "${CGROUP_PATH}" 2>/dev/null || log_warn "Failed to remove existing cgroup (may have processes)"
+fi
+
+# Create new cgroup
+log_info "Creating cgroup: ${CGROUP_PATH}"
+sudo mkdir -p "${CGROUP_PATH}"
+
+# Set memory limit (memory.max controls the hard limit)
+log_info "Setting memory.max to ${MEMORY_LIMIT_BYTES} bytes"
+echo "${MEMORY_LIMIT_BYTES}" | sudo tee "${CGROUP_PATH}/memory.max" > /dev/null
+
+# Optionally set memory.high (soft limit for throttling before OOM)
+# Set it to 95% of max to get early warnings
+MEMORY_HIGH_BYTES=$((MEMORY_LIMIT_BYTES * 95 / 100))
+log_info "Setting memory.high to ${MEMORY_HIGH_BYTES} bytes (95% of max)"
+echo "${MEMORY_HIGH_BYTES}" | sudo tee "${CGROUP_PATH}/memory.high" > /dev/null
+
 # Start MySQL server
 log_info "Starting MySQL server..."
 if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
@@ -372,6 +407,23 @@ else
     "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
 fi
 MYSQLD_PID=$!
+
+# Add mysqld process to the cgroup
+log_info "Adding mysqld process (PID: ${MYSQLD_PID}) to cgroup ${CGROUP_NAME}"
+echo "${MYSQLD_PID}" | sudo tee "${CGROUP_PATH}/cgroup.procs" > /dev/null
+
+# Verify the process is in the cgroup
+CGROUP_CHECK=$(cat /proc/${MYSQLD_PID}/cgroup 2>/dev/null | grep "${CGROUP_NAME}" || echo "")
+if [ -n "${CGROUP_CHECK}" ]; then
+    log_info "Successfully added mysqld to cgroup: ${CGROUP_CHECK}"
+else
+    log_warn "Could not verify mysqld is in cgroup, check /proc/${MYSQLD_PID}/cgroup"
+fi
+
+# Display current memory limit settings
+log_info "Current cgroup memory settings:"
+log_info "  memory.max: $(cat ${CGROUP_PATH}/memory.max)"
+log_info "  memory.high: $(cat ${CGROUP_PATH}/memory.high)"
 
 # Set OOM score adjustment to protect mysqld from OOM killer
 # log_info "Setting OOM score adjustment to -500 for mysqld (PID: ${MYSQLD_PID})..."
@@ -617,6 +669,12 @@ trap_handler() {
         log_info "Stopping MySQL server..."
         kill ${MYSQLD_PID} 2>/dev/null || true
         wait ${MYSQLD_PID} 2>/dev/null || true
+    fi
+
+    # Remove cgroup
+    if [ -d "${CGROUP_PATH}" ]; then
+        log_info "Removing cgroup: ${CGROUP_PATH}"
+        sudo rmdir "${CGROUP_PATH}" 2>/dev/null || log_warn "Failed to remove cgroup (may need manual cleanup)"
     fi
 
     log_info "Cleanup completed"
@@ -1022,6 +1080,14 @@ if kill -0 ${MYSQLD_PID} 2>/dev/null; then
     log_info "MySQL server killed"
 else
     log_info "MySQL server already stopped"
+fi
+
+# Remove cgroup after mysqld is stopped
+if [ -d "${CGROUP_PATH}" ]; then
+    log_info "Removing cgroup: ${CGROUP_PATH}"
+    # Wait a moment for processes to fully exit
+    sleep 2
+    sudo rmdir "${CGROUP_PATH}" 2>/dev/null && log_info "Cgroup removed successfully" || log_warn "Failed to remove cgroup (may need manual cleanup with: sudo rmdir ${CGROUP_PATH})"
 fi
 
 # Copy HammerDB transaction profile log if it exists
