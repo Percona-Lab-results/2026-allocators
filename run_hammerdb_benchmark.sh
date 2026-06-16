@@ -10,7 +10,8 @@ set -euo pipefail
 #   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3 nobinlog myrocks
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_DATA_DIR="${HOME}/servers/data"
+# Use absolute path for data directory (expand ${HOME} immediately)
+SERVER_DATA_DIR="$(eval echo ${HOME})/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
 MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
@@ -162,12 +163,17 @@ log_info "Creating MySQL configuration file: ${MY_CNF}"
 log_info "Storage engine: ${STORAGE_ENGINE}"
 log_info "Binary logging: ${ENABLE_BINLOG}"
 
+# Ensure data directory exists and get absolute path
+mkdir -p "${SERVER_DATA_DIR}"
+ABSOLUTE_DATA_DIR="$(realpath "${SERVER_DATA_DIR}")"
+log_info "Data directory (absolute): ${ABSOLUTE_DATA_DIR}"
+
 cat > "${MY_CNF}" <<EOF
 [mysqld]
 # Server configuration for HammerDB TPC-C benchmark
 
-# Data directory
-datadir=${SERVER_DATA_DIR}
+# Data directory - must be absolute path
+datadir = ${ABSOLUTE_DATA_DIR}
 
 EOF
 
@@ -175,7 +181,7 @@ EOF
 if [ "${ENABLE_BINLOG}" = "binlog" ]; then
     cat >> "${MY_CNF}" <<EOF
 # Binary logging enabled
-log-bin = ${SERVER_DATA_DIR}/mysql-bin
+log-bin = ${ABSOLUTE_DATA_DIR}/mysql-bin
 sync_binlog = 1000
 server_id = 1
 
@@ -199,8 +205,8 @@ cat >> "${MY_CNF}" <<EOF
 max_connections = 200
 
 # Logging
-log-error = ${SERVER_DATA_DIR}/mysql-error.log
-pid-file = ${SERVER_DATA_DIR}/mysql.pid
+log-error = ${ABSOLUTE_DATA_DIR}/mysql-error.log
+pid-file = ${ABSOLUTE_DATA_DIR}/mysql.pid
 
 # Socket
 socket = ${MYSQL_SOCKET}
@@ -301,27 +307,30 @@ fi
 
 # 4. Remove old server data directory and create fresh one
 if [ "${SKIP_INIT}" = "noskip" ]; then
-    if [ -d "${SERVER_DATA_DIR}" ]; then
-       log_info "Removing old server data directory: ${SERVER_DATA_DIR}"
-       rm -rf "${SERVER_DATA_DIR}"
+    if [ -d "${ABSOLUTE_DATA_DIR}" ]; then
+       log_info "Removing old server data directory: ${ABSOLUTE_DATA_DIR}"
+       rm -rf "${ABSOLUTE_DATA_DIR}"
     fi
 
-    log_info "Creating fresh server data directory: ${SERVER_DATA_DIR}"
-    mkdir -p "${SERVER_DATA_DIR}"
+    log_info "Creating fresh server data directory: ${ABSOLUTE_DATA_DIR}"
+    mkdir -p "${ABSOLUTE_DATA_DIR}"
+
+    # Ensure the directory is owned by the current user
+    sudo chown -R $(whoami):$(whoami) "${ABSOLUTE_DATA_DIR}" || true
 
     # Initialize data directory
-    log_info "Initializing MySQL data directory..."
+    log_info "Initializing MySQL data directory: ${ABSOLUTE_DATA_DIR}"
     if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
         LD_LIBRARY_PATH="${MYSQLD_LD_LIBRARY_PATH}" "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
-         --datadir="${SERVER_DATA_DIR}"
+         --datadir="${ABSOLUTE_DATA_DIR}"
     else
         "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
-         --datadir="${SERVER_DATA_DIR}"
+         --datadir="${ABSOLUTE_DATA_DIR}"
     fi
 else
-    log_info "Skipping initialization - using existing data directory: ${SERVER_DATA_DIR}"
-    if [ ! -d "${SERVER_DATA_DIR}" ]; then
-        log_error "Data directory does not exist: ${SERVER_DATA_DIR}"
+    log_info "Skipping initialization - using existing data directory: ${ABSOLUTE_DATA_DIR}"
+    if [ ! -d "${ABSOLUTE_DATA_DIR}" ]; then
+        log_error "Data directory does not exist: ${ABSOLUTE_DATA_DIR}"
         exit 1
     fi
 fi
@@ -448,7 +457,7 @@ for i in {1..300}; do
     # Check if mysqld process is still alive
     if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
         log_error "mysqld process (PID: ${MYSQLD_PID}) has died"
-        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+        log_error "Check error log: ${ABSOLUTE_DATA_DIR}/mysql-error.log"
         exit 1
     fi
 
@@ -464,7 +473,7 @@ for i in {1..300}; do
     if [ $i -eq 300 ]; then
         log_error "MySQL server failed to start after 600 seconds"
         log_error "Last connection error: ${CONNECT_OUTPUT}"
-        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+        log_error "Check error log: ${ABSOLUTE_DATA_DIR}/mysql-error.log"
         kill ${MYSQLD_PID} 2>/dev/null || true
         exit 1
     fi
@@ -1001,7 +1010,7 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
     # Check if mysqld process is still alive
     if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
         log_error "mysqld process (PID: ${MYSQLD_PID}) has died unexpectedly!"
-        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+        log_error "Check error log: ${ABSOLUTE_DATA_DIR}/mysql-error.log"
         kill ${HAMMERDB_PID} 2>/dev/null || true
         [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
         [ -n "${RSS_COLLECTOR_PID}" ] && kill ${RSS_COLLECTOR_PID} 2>/dev/null || true
