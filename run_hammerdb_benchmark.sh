@@ -2,22 +2,20 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog> <storage_engine:innodb|myrocks>
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks --run-duration=N --break-duration=N --run-number=N
 #
 # Examples:
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog innodb
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2 binlog innodb
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3 nobinlog myrocks
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb --run-duration=600 --break-duration=20 --run-number=2
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=yes --buffer-gb=110 --results-suffix=test2 --binlog=yes --engine=innodb --run-duration=1200 --break-duration=30 --run-number=3
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=no --allocator=tcmalloc --skip-init=no --buffer-gb=64 --results-suffix=test3 --binlog=no --engine=myrocks --run-duration=300 --break-duration=10 --run-number=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
 MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
-BENCHMARK_DURATION_MINUTES=600  # 10 hours = 600 minutes
 RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
-WAIT_BETWEEN_RUNS_MINUTES=20     # Wait time between first and second run
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,21 +47,96 @@ log_info "Killing any existing mysqld processes..."
 sudo killall mysqld 2>/dev/null || true
 sleep 2
 
-# Check command line arguments
-if [ $# -ne 8 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog> <storage_engine:innodb|myrocks>"
-    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog innodb"
+# Parse named command line arguments
+SERVER_BINARY=""
+THP_ENABLED=""
+ALLOCATOR=""
+SKIP_INIT=""
+BUFFER_POOL_SIZE_GB=""
+RESULTS_SUFFIX=""
+ENABLE_BINLOG=""
+STORAGE_ENGINE=""
+BENCHMARK_DURATION_MINUTES=""
+WAIT_BETWEEN_RUNS_MINUTES=""
+NUMBER_OF_RUNS=""
+
+for arg in "$@"; do
+    case $arg in
+        --server=*)
+            SERVER_BINARY="${arg#*=}"
+            shift
+            ;;
+        --thp=*)
+            THP_VALUE="${arg#*=}"
+            case $THP_VALUE in
+                yes) THP_ENABLED="thp" ;;
+                no) THP_ENABLED="nothp" ;;
+                *) log_error "Invalid --thp value: $THP_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --allocator=*)
+            ALLOCATOR="${arg#*=}"
+            shift
+            ;;
+        --skip-init=*)
+            SKIP_VALUE="${arg#*=}"
+            case $SKIP_VALUE in
+                yes) SKIP_INIT="skip" ;;
+                no) SKIP_INIT="noskip" ;;
+                *) log_error "Invalid --skip-init value: $SKIP_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --buffer-gb=*)
+            BUFFER_POOL_SIZE_GB="${arg#*=}"
+            shift
+            ;;
+        --results-suffix=*)
+            RESULTS_SUFFIX="${arg#*=}"
+            shift
+            ;;
+        --binlog=*)
+            BINLOG_VALUE="${arg#*=}"
+            case $BINLOG_VALUE in
+                yes) ENABLE_BINLOG="binlog" ;;
+                no) ENABLE_BINLOG="nobinlog" ;;
+                *) log_error "Invalid --binlog value: $BINLOG_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --engine=*)
+            STORAGE_ENGINE="${arg#*=}"
+            shift
+            ;;
+        --run-duration=*)
+            BENCHMARK_DURATION_MINUTES="${arg#*=}"
+            shift
+            ;;
+        --break-duration=*)
+            WAIT_BETWEEN_RUNS_MINUTES="${arg#*=}"
+            shift
+            ;;
+        --run-number=*)
+            NUMBER_OF_RUNS="${arg#*=}"
+            shift
+            ;;
+        *)
+            log_error "Unknown argument: $arg"
+            exit 1
+            ;;
+    esac
+done
+
+# Check that all required arguments are provided
+if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
+   [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
+   [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ] || [ -z "${BENCHMARK_DURATION_MINUTES}" ] || \
+   [ -z "${WAIT_BETWEEN_RUNS_MINUTES}" ] || [ -z "${NUMBER_OF_RUNS}" ]; then
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks --run-duration=N --break-duration=N --run-number=N"
+    log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb --run-duration=600 --break-duration=20 --run-number=2"
     exit 1
 fi
-
-SERVER_BINARY="$1"
-THP_ENABLED="$2"
-ALLOCATOR="$3"
-SKIP_INIT="$4"
-BUFFER_POOL_SIZE_GB="$5"
-RESULTS_SUFFIX="$6"
-ENABLE_BINLOG="$7"
-STORAGE_ENGINE="$8"
 
 # Set results directory with suffix and parameters
 RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}-${STORAGE_ENGINE}"
@@ -102,6 +175,24 @@ fi
 
 if [[ ! "${STORAGE_ENGINE}" =~ ^(innodb|myrocks)$ ]]; then
     log_error "Storage engine parameter must be 'innodb' or 'myrocks', got: ${STORAGE_ENGINE}"
+    exit 1
+fi
+
+# Validate run duration is a positive integer
+if ! [[ "${BENCHMARK_DURATION_MINUTES}" =~ ^[0-9]+$ ]] || [ "${BENCHMARK_DURATION_MINUTES}" -lt 1 ]; then
+    log_error "Run duration must be a positive integer (in minutes), got: ${BENCHMARK_DURATION_MINUTES}"
+    exit 1
+fi
+
+# Validate break duration is a non-negative integer
+if ! [[ "${WAIT_BETWEEN_RUNS_MINUTES}" =~ ^[0-9]+$ ]]; then
+    log_error "Break duration must be a non-negative integer (in minutes), got: ${WAIT_BETWEEN_RUNS_MINUTES}"
+    exit 1
+fi
+
+# Validate number of runs is a positive integer
+if ! [[ "${NUMBER_OF_RUNS}" =~ ^[0-9]+$ ]] || [ "${NUMBER_OF_RUNS}" -lt 1 ]; then
+    log_error "Number of runs must be a positive integer, got: ${NUMBER_OF_RUNS}"
     exit 1
 fi
 
@@ -929,7 +1020,7 @@ collect_mpstat() {
     kill ${mpstat_pid} 2>/dev/null || true
 }
 
-# Initialize continuous data collection files (shared across both runs)
+# Initialize continuous data collection files (shared across all runs)
 DATE_TIME=$(date +%Y%m%d_%H%M%S)
 FILE_PREFIX="${THP_ENABLED}_${ALLOCATOR}"
 STATUS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mysql_status_${DATE_TIME}.log"
@@ -945,48 +1036,48 @@ IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
 MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
 
 # Add headers to continuous monitoring files
-echo "# MySQL /proc/${MYSQLD_PID}/status data collection (continuous across both runs)" > "${STATUS_FILE}"
+echo "# MySQL /proc/${MYSQLD_PID}/status data collection (continuous across all runs)" > "${STATUS_FILE}"
 echo "# Started at: $(date)" >> "${STATUS_FILE}"
 echo "" >> "${STATUS_FILE}"
 
-echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection (continuous across both runs)" > "${SMAPS_ROLLUP_FILE}"
+echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection (continuous across all runs)" > "${SMAPS_ROLLUP_FILE}"
 echo "# Started at: $(date)" >> "${SMAPS_ROLLUP_FILE}"
 echo "" >> "${SMAPS_ROLLUP_FILE}"
 
-echo "# MySQL /proc/${MYSQLD_PID}/smaps data collection (every 30 seconds, continuous across both runs)" > "${SMAPS_FILE}"
+echo "# MySQL /proc/${MYSQLD_PID}/smaps data collection (every 30 seconds, continuous across all runs)" > "${SMAPS_FILE}"
 echo "# Started at: $(date)" >> "${SMAPS_FILE}"
 echo "" >> "${SMAPS_FILE}"
 
-echo "# MySQL /proc/${MYSQLD_PID}/stat data collection (continuous across both runs)" > "${STAT_FILE}"
+echo "# MySQL /proc/${MYSQLD_PID}/stat data collection (continuous across all runs)" > "${STAT_FILE}"
 echo "# Started at: $(date)" >> "${STAT_FILE}"
 echo "" >> "${STAT_FILE}"
 
-echo "# MySQL /proc/${MYSQLD_PID}/maps data collection (continuous across both runs)" > "${MAPS_FILE}"
+echo "# MySQL /proc/${MYSQLD_PID}/maps data collection (continuous across all runs)" > "${MAPS_FILE}"
 echo "# Started at: $(date)" >> "${MAPS_FILE}"
 echo "" >> "${MAPS_FILE}"
 
-echo "# RSS (Resident Memory Size) monitoring for mysqld and hammerdbcli (continuous across both runs)" > "${RSS_FILE}"
+echo "# RSS (Resident Memory Size) monitoring for mysqld and hammerdbcli (continuous across all runs)" > "${RSS_FILE}"
 echo "# Started at: $(date)" >> "${RSS_FILE}"
 echo "# Format: Timestamp, mysqld_PID, mysqld_RSS_KB, hammerdbcli_PIDs, total_hammerdbcli_RSS_KB" >> "${RSS_FILE}"
 echo "" >> "${RSS_FILE}"
 
-echo "# MySQL SHOW GLOBAL STATUS data collection (every 30 seconds, continuous across both runs)" > "${GLOBAL_STATUS_FILE}"
+echo "# MySQL SHOW GLOBAL STATUS data collection (every 30 seconds, continuous across all runs)" > "${GLOBAL_STATUS_FILE}"
 echo "# Started at: $(date)" >> "${GLOBAL_STATUS_FILE}"
 echo "" >> "${GLOBAL_STATUS_FILE}"
 
-echo "# MySQL SHOW GLOBAL VARIABLES data collection (every 30 seconds, continuous across both runs)" > "${GLOBAL_VARS_FILE}"
+echo "# MySQL SHOW GLOBAL VARIABLES data collection (every 30 seconds, continuous across all runs)" > "${GLOBAL_VARS_FILE}"
 echo "# Started at: $(date)" >> "${GLOBAL_VARS_FILE}"
 echo "" >> "${GLOBAL_VARS_FILE}"
 
-echo "# vmstat system statistics (every 1 second, continuous across both runs)" > "${VMSTAT_FILE}"
+echo "# vmstat system statistics (every 1 second, continuous across all runs)" > "${VMSTAT_FILE}"
 echo "# Started at: $(date)" >> "${VMSTAT_FILE}"
 echo "" >> "${VMSTAT_FILE}"
 
-echo "# iostat extended disk statistics (every 1 second, continuous across both runs)" > "${IOSTAT_FILE}"
+echo "# iostat extended disk statistics (every 1 second, continuous across all runs)" > "${IOSTAT_FILE}"
 echo "# Started at: $(date)" >> "${IOSTAT_FILE}"
 echo "" >> "${IOSTAT_FILE}"
 
-echo "# mpstat per-CPU statistics (every 1 second, continuous across both runs)" > "${MPSTAT_FILE}"
+echo "# mpstat per-CPU statistics (every 1 second, continuous across all runs)" > "${MPSTAT_FILE}"
 echo "# Started at: $(date)" >> "${MPSTAT_FILE}"
 echo "" >> "${MPSTAT_FILE}"
 
@@ -1026,46 +1117,45 @@ MPSTAT_PID=$!
 
 log_info "Continuous data collectors started"
 
-# Run first benchmark iteration
-log_info "======================================"
-log_info "Starting first benchmark run"
-log_info "======================================"
-run_benchmark_iteration 1 "_run1"
-FIRST_RUN_EXIT=$?
+# Run benchmark iterations
+declare -a RUN_EXIT_CODES=()
 
-# Wait 20 minutes before second run
-log_info "======================================"
-log_info "First run completed. Waiting ${WAIT_BETWEEN_RUNS_MINUTES} minutes before second run..."
-log_info "MySQL server remains running (PID: ${MYSQLD_PID})"
-log_info "======================================"
+for run_num in $(seq 1 ${NUMBER_OF_RUNS}); do
+    log_info "======================================"
+    log_info "Starting benchmark run ${run_num} of ${NUMBER_OF_RUNS}"
+    log_info "======================================"
+    run_benchmark_iteration ${run_num} "_run${run_num}"
+    RUN_EXIT_CODES+=($?)
 
-WAIT_START=$(date +%s)
-WAIT_END=$((WAIT_START + WAIT_BETWEEN_RUNS_MINUTES * 60))
+    # Wait between runs (except after the last run)
+    if [ ${run_num} -lt ${NUMBER_OF_RUNS} ]; then
+        log_info "======================================"
+        log_info "Run ${run_num} completed. Waiting ${WAIT_BETWEEN_RUNS_MINUTES} minutes before run $((run_num + 1))..."
+        log_info "MySQL server remains running (PID: ${MYSQLD_PID})"
+        log_info "======================================"
 
-while [ $(date +%s) -lt ${WAIT_END} ]; do
-    REMAINING=$((WAIT_END - $(date +%s)))
-    MINUTES=$((REMAINING / 60))
-    SECONDS=$((REMAINING % 60))
+        WAIT_START=$(date +%s)
+        WAIT_END=$((WAIT_START + WAIT_BETWEEN_RUNS_MINUTES * 60))
 
-    # Check if mysqld is still alive during wait
-    if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
-        log_error "mysqld process (PID: ${MYSQLD_PID}) has died during wait period!"
-        log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
-        exit 1
+        while [ $(date +%s) -lt ${WAIT_END} ]; do
+            REMAINING=$((WAIT_END - $(date +%s)))
+            MINUTES=$((REMAINING / 60))
+            SECONDS=$((REMAINING % 60))
+
+            # Check if mysqld is still alive during wait
+            if ! kill -0 ${MYSQLD_PID} 2>/dev/null; then
+                log_error "mysqld process (PID: ${MYSQLD_PID}) has died during wait period!"
+                log_error "Check error log: ${SERVER_DATA_DIR}/mysql-error.log"
+                exit 1
+            fi
+
+            if [ $((REMAINING % 60)) -eq 0 ]; then
+                log_info "Waiting... ${MINUTES} minutes remaining"
+            fi
+            sleep 10
+        done
     fi
-
-    if [ $((REMAINING % 60)) -eq 0 ]; then
-        log_info "Waiting... ${MINUTES} minutes remaining"
-    fi
-    sleep 10
 done
-
-# Run second benchmark iteration
-log_info "======================================"
-log_info "Starting second benchmark run"
-log_info "======================================"
-run_benchmark_iteration 2 "_run2"
-SECOND_RUN_EXIT=$?
 
 # Stop data collectors
 log_info "Stopping data collectors..."
@@ -1114,22 +1204,21 @@ log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
 log_info "Benchmark duration: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
 log_info "Total duration per run: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
 log_info "Wait between runs: ${WAIT_BETWEEN_RUNS_MINUTES} minutes"
-log_info "Number of runs: 2"
-log_info "First run exit code: ${FIRST_RUN_EXIT}"
-log_info "Second run exit code: ${SECOND_RUN_EXIT}"
+log_info "Number of runs: ${NUMBER_OF_RUNS}"
+for run_num in $(seq 1 ${NUMBER_OF_RUNS}); do
+    log_info "Run ${run_num} exit code: ${RUN_EXIT_CODES[$((run_num - 1))]}"
+done
 log_info "Results directory: ${RESULTS_DIR}"
 log_info ""
 log_info "HammerDB run files:"
-log_info "  - Run 1 output: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output_run1.log"
-if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run1.log" ]; then
-    log_info "  - Run 1 transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run1.log"
-fi
-log_info "  - Run 2 output: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output_run2.log"
-if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run2.log" ]; then
-    log_info "  - Run 2 transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run2.log"
-fi
+for run_num in $(seq 1 ${NUMBER_OF_RUNS}); do
+    log_info "  - Run ${run_num} output: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hammerdb_output_run${run_num}.log"
+    if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run${run_num}.log" ]; then
+        log_info "  - Run ${run_num} transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile_run${run_num}.log"
+    fi
+done
 log_info ""
-log_info "Continuous monitoring files (cover both runs and the wait period):"
+log_info "Continuous monitoring files (cover all runs and wait periods):"
 log_info "  - MySQL status data: ${STATUS_FILE}"
 log_info "  - MySQL smaps_rollup data: ${SMAPS_ROLLUP_FILE}"
 log_info "  - MySQL smaps data: ${SMAPS_FILE}"
@@ -1143,8 +1232,16 @@ log_info "  - iostat disk statistics: ${IOSTAT_FILE}"
 log_info "  - mpstat per-CPU statistics: ${MPSTAT_FILE}"
 log_info "======================================"
 
-# Exit with non-zero if either run failed
-if [ ${FIRST_RUN_EXIT} -ne 0 ] || [ ${SECOND_RUN_EXIT} -ne 0 ]; then
+# Exit with non-zero if any run failed
+ANY_FAILED=0
+for exit_code in "${RUN_EXIT_CODES[@]}"; do
+    if [ ${exit_code} -ne 0 ]; then
+        ANY_FAILED=1
+        break
+    fi
+done
+
+if [ ${ANY_FAILED} -eq 1 ]; then
     exit 1
 else
     exit 0
