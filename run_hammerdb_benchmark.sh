@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog> <storage_engine:innodb|myrocks>
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks
 #
 # Examples:
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog innodb
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld thp jemalloc53 skip 110 test2 binlog innodb
-#   ./run_hammerdb_benchmark.sh /opt/percona/bin/mysqld nothp tcmalloc noskip 64 test3 nobinlog myrocks
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=yes --buffer-gb=110 --results-suffix=test2 --binlog=yes --engine=innodb
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=no --allocator=tcmalloc --skip-init=no --buffer-gb=64 --results-suffix=test3 --binlog=no --engine=myrocks
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
@@ -48,21 +48,80 @@ log_info "Killing any existing mysqld processes..."
 sudo killall mysqld 2>/dev/null || true
 sleep 2
 
-# Check command line arguments
-if [ $# -ne 8 ]; then
-    log_error "Usage: $0 <server_binary_path> <thp:thp|nothp> <allocator:jemalloc36|jemalloc53|tcmalloc|glibc> <skip_init:skip|noskip> <buffer_pool_size_gb> <suffix> <enable_binlog:binlog|nobinlog> <storage_engine:innodb|myrocks>"
-    log_error "Example: $0 /opt/percona/bin/mysqld thp jemalloc53 noskip 110 test1 nobinlog innodb"
+# Parse named command line arguments
+SERVER_BINARY=""
+THP_ENABLED=""
+ALLOCATOR=""
+SKIP_INIT=""
+BUFFER_POOL_SIZE_GB=""
+RESULTS_SUFFIX=""
+ENABLE_BINLOG=""
+STORAGE_ENGINE=""
+
+for arg in "$@"; do
+    case $arg in
+        --server=*)
+            SERVER_BINARY="${arg#*=}"
+            shift
+            ;;
+        --thp=*)
+            THP_VALUE="${arg#*=}"
+            case $THP_VALUE in
+                yes) THP_ENABLED="thp" ;;
+                no) THP_ENABLED="nothp" ;;
+                *) log_error "Invalid --thp value: $THP_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --allocator=*)
+            ALLOCATOR="${arg#*=}"
+            shift
+            ;;
+        --skip-init=*)
+            SKIP_VALUE="${arg#*=}"
+            case $SKIP_VALUE in
+                yes) SKIP_INIT="skip" ;;
+                no) SKIP_INIT="noskip" ;;
+                *) log_error "Invalid --skip-init value: $SKIP_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --buffer-gb=*)
+            BUFFER_POOL_SIZE_GB="${arg#*=}"
+            shift
+            ;;
+        --results-suffix=*)
+            RESULTS_SUFFIX="${arg#*=}"
+            shift
+            ;;
+        --binlog=*)
+            BINLOG_VALUE="${arg#*=}"
+            case $BINLOG_VALUE in
+                yes) ENABLE_BINLOG="binlog" ;;
+                no) ENABLE_BINLOG="nobinlog" ;;
+                *) log_error "Invalid --binlog value: $BINLOG_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --engine=*)
+            STORAGE_ENGINE="${arg#*=}"
+            shift
+            ;;
+        *)
+            log_error "Unknown argument: $arg"
+            exit 1
+            ;;
+    esac
+done
+
+# Check that all required arguments are provided
+if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
+   [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
+   [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ]; then
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks"
+    log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb"
     exit 1
 fi
-
-SERVER_BINARY="$1"
-THP_ENABLED="$2"
-ALLOCATOR="$3"
-SKIP_INIT="$4"
-BUFFER_POOL_SIZE_GB="$5"
-RESULTS_SUFFIX="$6"
-ENABLE_BINLOG="$7"
-STORAGE_ENGINE="$8"
 
 # Set results directory with suffix and parameters
 RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}-${STORAGE_ENGINE}"
