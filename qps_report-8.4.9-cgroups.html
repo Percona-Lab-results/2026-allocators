@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HammerDB QPS Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -124,6 +126,32 @@
         .zoom-button:active {
             background-color: #3d8b40;
         }
+        .reset-zoom-button {
+            margin-left: 10px;
+            padding: 10px 20px;
+            background-color: #f44336;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .reset-zoom-button:hover {
+            background-color: #da190b;
+        }
+        .reset-zoom-button:active {
+            background-color: #c2150a;
+        }
+        .zoom-info {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 5px;
+            font-size: 13px;
+            color: #856404;
+        }
     </style>
 </head>
 <body>
@@ -142,6 +170,10 @@
                 <!-- Checkboxes will be generated here -->
             </div>
             <button id="zoomButton" class="zoom-button">Zoom In (Start at 40k)</button>
+            <button id="resetZoomButton" class="reset-zoom-button">Reset Zoom</button>
+            <div class="zoom-info">
+                💡 <strong>Tip:</strong> Click and drag on the graph to zoom into a specific area. Use the "Reset Zoom" button to return to full view.
+            </div>
         </div>
 
         <h2>QPS Over Time (by Uptime)</h2>
@@ -150,7 +182,17 @@
         </div>
 
         <h2>MySQL RSS Memory Usage Over Time</h2>
-        <button id="rssZoomButton" class="zoom-button" style="margin-bottom: 15px;">Zoom In (Start at 160k MB)</button>
+        <div class="controls">
+            <h3>RSS Graph Controls</h3>
+            <div class="checkbox-grid" id="rssCheckboxGrid">
+                <!-- Checkboxes will be generated here -->
+            </div>
+            <button id="rssZoomButton" class="zoom-button">Zoom In (Start at 160k MB)</button>
+            <button id="rssResetZoomButton" class="reset-zoom-button">Reset Zoom</button>
+            <div class="zoom-info">
+                💡 <strong>Tip:</strong> Click and drag on the graph to zoom into a specific area. Use the "Reset Zoom" button to return to full view.
+            </div>
+        </div>
         <div class="chart-container">
             <canvas id="rssChart"></canvas>
         </div>
@@ -95001,6 +95043,21 @@
                                 return context.dataset.label + ': ' + context.parsed.y.toFixed(2) + ' QPS';
                             }
                         }
+                    },
+                    zoom: {
+                        pan: {
+                            enabled: true,
+                            mode: 'xy',
+                        },
+                        zoom: {
+                            drag: {
+                                enabled: true,
+                                backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                                borderColor: 'rgb(54, 162, 235)',
+                                borderWidth: 2,
+                            },
+                            mode: 'xy',
+                        }
                     }
                 },
                 scales: {
@@ -95057,6 +95114,21 @@
                             label: function(context) {
                                 return context.dataset.label + ': ' + context.parsed.y.toFixed(2) + ' MB';
                             }
+                        }
+                    },
+                    zoom: {
+                        pan: {
+                            enabled: true,
+                            mode: 'xy',
+                        },
+                        zoom: {
+                            drag: {
+                                enabled: true,
+                                backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                                borderColor: 'rgb(54, 162, 235)',
+                                borderWidth: 2,
+                            },
+                            mode: 'xy',
                         }
                     }
                 },
@@ -95202,6 +95274,58 @@
             qpsChart.update();
         });
 
+        // Reset zoom button for QPS chart
+        const resetZoomButton = document.getElementById('resetZoomButton');
+        resetZoomButton.addEventListener('click', function() {
+            qpsChart.resetZoom();
+            // Also reset the Y-axis zoom
+            qpsChart.options.scales.y.min = 0;
+            qpsChart.options.scales.y.beginAtZero = true;
+            zoomButton.textContent = 'Zoom In (Start at 40k)';
+            isZoomedIn = false;
+            qpsChart.update();
+        });
+
+        // Generate checkboxes for RSS graph visibility control
+        const rssCheckboxGrid = document.getElementById('rssCheckboxGrid');
+
+        rssDatasets.forEach((dataset, idx) => {
+            const div = document.createElement('div');
+            div.className = 'checkbox-item';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.id = `rss-graph-${idx}`;
+            checkbox.checked = true;
+            checkbox.addEventListener('change', function() {
+                // Toggle visibility of RSS dataset
+                rssChart.data.datasets[idx].hidden = !this.checked;
+                rssChart.update();
+            });
+
+            const label = document.createElement('label');
+            label.htmlFor = `rss-graph-${idx}`;
+
+            // Get the color from the dataset
+            const color = dataset.borderColor;
+
+            // Create color indicator
+            const colorIndicator = document.createElement('span');
+            colorIndicator.className = 'color-indicator';
+            colorIndicator.style.backgroundColor = color;
+
+            // Create text span
+            const textSpan = document.createElement('span');
+            textSpan.textContent = dataset.label;
+
+            label.appendChild(colorIndicator);
+            label.appendChild(textSpan);
+
+            div.appendChild(checkbox);
+            div.appendChild(label);
+            rssCheckboxGrid.appendChild(div);
+        });
+
         // Zoom button functionality for RSS chart
         let isRssZoomedIn = false;
         const rssZoomButton = document.getElementById('rssZoomButton');
@@ -95219,6 +95343,18 @@
                 rssZoomButton.textContent = 'Reset Zoom';
                 isRssZoomedIn = true;
             }
+            rssChart.update();
+        });
+
+        // Reset zoom button for RSS chart
+        const rssResetZoomButton = document.getElementById('rssResetZoomButton');
+        rssResetZoomButton.addEventListener('click', function() {
+            rssChart.resetZoom();
+            // Also reset the Y-axis zoom
+            rssChart.options.scales.y.min = 0;
+            rssChart.options.scales.y.beginAtZero = true;
+            rssZoomButton.textContent = 'Zoom In (Start at 160k MB)';
+            isRssZoomedIn = false;
             rssChart.update();
         });
     </script>
