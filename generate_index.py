@@ -22,6 +22,8 @@ def get_description(filename):
         return "Report showing the effect of changing MALLOC_ARENA_MAX from 8 to 2 in glibc"
     elif 'cgroups' in name:
         return "Report showing the effect of limiting memory available to mysqld using cgroups"
+    elif 'breaks' in name:
+        return "Report with multiple runs and breaks to help reclaim memory"
     elif name == 'qps_report-8.4.9.html':
         return "General report about all memory allocators performance in Percona Server 8.4.9"
     elif 'myrocks' in name:
