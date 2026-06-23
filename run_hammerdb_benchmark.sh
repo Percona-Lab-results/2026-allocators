@@ -642,6 +642,11 @@ HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
 
 cat > "${HAMMERDB_RUN_TCL}" <<EOF
 #!/usr/bin/tclsh
+
+# Source custom OLTP driver with connection cycling
+puts "Loading custom OLTP driver: ${SCRIPT_DIR}/mysqloltp.tcl"
+source ${SCRIPT_DIR}/mysqloltp.tcl
+
 puts "SETTING CONFIGURATION FOR TPC-C RUN"
 dbset db mysql
 dbset bm TPC-C
@@ -699,25 +704,26 @@ if {[catch {vurun} result]} {
 puts "TPC-C TEST STARTED"
 EOF
 
-# 7.5 Patch HammerDB TPC-C driver to add connection cycling after 1M iterations
-HAMMERDB_DRIVER="${SCRIPT_DIR}/HammerDB-6.0/src/mysql/mysqltpcc.tcl"
+# 7.5 Patch mysqloltp.tcl to add connection cycling after 1M iterations
+HAMMERDB_DRIVER="${SCRIPT_DIR}/mysqloltp.tcl"
 ITERATIONS_PER_CONNECTION=1000000
 
 if [ ! -f "${HAMMERDB_DRIVER}" ]; then
-    log_error "HammerDB TPC-C driver not found at: ${HAMMERDB_DRIVER}"
+    log_error "mysqloltp.tcl not found at: ${HAMMERDB_DRIVER}"
+    log_error "Please ensure mysqloltp.tcl exists in the current directory"
     kill ${MYSQLD_PID} 2>/dev/null || true
     exit 1
 fi
 
-# Create backup of original driver if it doesn't exist
+# Create backup if it doesn't exist
 if [ ! -f "${HAMMERDB_DRIVER}.orig" ]; then
     cp "${HAMMERDB_DRIVER}" "${HAMMERDB_DRIVER}.orig"
-    log_info "Created backup of original driver: ${HAMMERDB_DRIVER}.orig"
+    log_info "Created backup: ${HAMMERDB_DRIVER}.orig"
 fi
 
-log_info "Patching HammerDB TPC-C driver to add connection cycling (${ITERATIONS_PER_CONNECTION} iterations per connection)..."
+log_info "Patching ${HAMMERDB_DRIVER} with connection cycling (${ITERATIONS_PER_CONNECTION} iterations per connection)..."
 
-# Restore original first
+# Restore from backup
 cp "${HAMMERDB_DRIVER}.orig" "${HAMMERDB_DRIVER}"
 
 # Convert microseconds to milliseconds for delay if specified
@@ -729,65 +735,41 @@ if [ "${DELAY_US}" -gt 0 ]; then
     log_info "Adding ${DELAY_US} microsecond (${DELAY_MS} ms) delay between transactions..."
 fi
 
-# Patch the driver to add connection cycling
-# Find the main transaction loop and add iteration counter with reconnect logic
-# The pattern: after each transaction, check if we've done 1M iterations, then reconnect
+# Patch the transaction loop to add connection cycling
+# The pattern: Add a connection counter and reconnect after N iterations
+sed -i '/^set stock_level_d_id.*RandomNumber 1 \$d_id_input/a\
+        # Connection cycling: reconnect after ITERATIONS_PER_CONNECTION transactions\
+        set conn_iteration_count 0\
+        set max_conn_iterations '"${ITERATIONS_PER_CONNECTION}" "${HAMMERDB_DRIVER}"
 
-cat > /tmp/hammerdb_patch.awk <<'AWKSCRIPT'
-BEGIN {
-    patched = 0
-    in_proc = 0
-}
+# Add reconnect logic inside the transaction loop
+# Find the line with "for {set it 0} {$it < $total_iterations} {incr it}" in the timed section (around line 2343)
+# and add connection cycling logic
+sed -i '/for {set it 0} {$it < $total_iterations} {incr it} {/,/^        }$/ {
+    /incr it} {/a\
+            incr conn_iteration_count\
+            if {$conn_iteration_count >= $max_conn_iterations} {\
+                puts "Reconnecting after $conn_iteration_count transactions..."\
+                catch {mysqlclose $mysql_handler}\
+                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]\
+                if {$prepare} {\
+                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }\
+                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }\
+                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }\
+                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }\
+                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }\
+                }\
+                set conn_iteration_count 0\
+            }
+}' "${HAMMERDB_DRIVER}"
 
-# Detect the start of the main procedure (usually run_test or similar)
-/^proc run_test/ || /^proc do_tpcc/ {
-    in_proc = 1
-    print $0
-    next
-}
+# Add optional delay after each transaction
+if [ -n "${DELAY_CLAUSE}" ]; then
+    # Add delay after each transaction type (after thinktime calls)
+    sed -i 's/\(if { \$KEYANDTHINK } { thinktime [0-9]* }\)/\1\n                '"${DELAY_CLAUSE}"'/g' "${HAMMERDB_DRIVER}"
+fi
 
-# After opening the connection, add iteration counter initialization
-/set mysql \[mysqlconnect/ {
-    print $0
-    if (!patched) {
-        print "    set iteration_count 0"
-        print "    set max_iterations_per_conn ITERATIONS_PER_CONNECTION"
-        patched = 1
-    }
-    next
-}
-
-# After each commit, increment counter and check for reconnect
-/mysqlcommit \$mysql/ {
-    print $0
-    if (patched) {
-        print "    DELAY_CLAUSE"
-        print "    incr iteration_count"
-        print "    if {\\$iteration_count >= \\$max_iterations_per_conn} {"
-        print "        puts \"Reconnecting after \\$iteration_count iterations...\""
-        print "        catch {mysqlclose \\$mysql}"
-        print "        set mysql [mysqlconnect -host \\$host -socket \\$socket -user \\$user -password \\$password -db \\$db]"
-        print "        set iteration_count 0"
-        print "    }"
-    }
-    next
-}
-
-# Default: print line as-is
-{
-    print $0
-}
-AWKSCRIPT
-
-# Apply the patch with variable substitution
-awk -v ITERATIONS_PER_CONNECTION="${ITERATIONS_PER_CONNECTION}" \
-    -v DELAY_CLAUSE="${DELAY_CLAUSE}" \
-    -f /tmp/hammerdb_patch.awk \
-    "${HAMMERDB_DRIVER}.orig" > "${HAMMERDB_DRIVER}"
-
-rm /tmp/hammerdb_patch.awk
-
-log_info "HammerDB driver patched successfully"
+log_info "Successfully patched ${HAMMERDB_DRIVER}"
 
 # 8. Run TPC-C test with configured Virtual Users and duration
 TOTAL_DURATION_MINUTES=$((BENCHMARK_DURATION_MINUTES + RAMPUP_DURATION_MINUTES))
