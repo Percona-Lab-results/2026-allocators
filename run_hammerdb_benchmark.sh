@@ -704,72 +704,23 @@ if {[catch {vurun} result]} {
 puts "TPC-C TEST STARTED"
 EOF
 
-# 7.5 Patch mysqloltp.tcl to add connection cycling after 1M iterations
+# 7.5 Verify mysqloltp.tcl exists (already manually patched with connection cycling)
 HAMMERDB_DRIVER="${SCRIPT_DIR}/mysqloltp.tcl"
-ITERATIONS_PER_CONNECTION=1000000
 
 if [ ! -f "${HAMMERDB_DRIVER}" ]; then
     log_error "mysqloltp.tcl not found at: ${HAMMERDB_DRIVER}"
     log_error "Please ensure mysqloltp.tcl exists in the current directory"
+    log_error "This file should be manually patched with connection cycling logic"
     kill ${MYSQLD_PID} 2>/dev/null || true
     exit 1
 fi
 
-# Create backup if it doesn't exist
-if [ ! -f "${HAMMERDB_DRIVER}.orig" ]; then
-    cp "${HAMMERDB_DRIVER}" "${HAMMERDB_DRIVER}.orig"
-    log_info "Created backup: ${HAMMERDB_DRIVER}.orig"
-fi
-
-log_info "Patching ${HAMMERDB_DRIVER} with connection cycling (${ITERATIONS_PER_CONNECTION} iterations per connection)..."
-
-# Restore from backup
-cp "${HAMMERDB_DRIVER}.orig" "${HAMMERDB_DRIVER}"
-
-# Convert microseconds to milliseconds for delay if specified
-DELAY_CLAUSE=""
+log_info "Using manually patched mysqloltp.tcl with connection cycling"
 if [ "${DELAY_US}" -gt 0 ]; then
     DELAY_MS=$((DELAY_US / 1000))
     [ "${DELAY_MS}" -eq 0 ] && DELAY_MS=1
-    DELAY_CLAUSE="after ${DELAY_MS}"
-    log_info "Adding ${DELAY_US} microsecond (${DELAY_MS} ms) delay between transactions..."
+    log_info "Transaction delay: ${DELAY_US} microseconds (${DELAY_MS} ms) - ensure mysqloltp.tcl is patched with delay support"
 fi
-
-# Patch the transaction loop to add connection cycling
-# The pattern: Add a connection counter and reconnect after N iterations
-sed -i '/^set stock_level_d_id.*RandomNumber 1 \$d_id_input/a\
-        # Connection cycling: reconnect after ITERATIONS_PER_CONNECTION transactions\
-        set conn_iteration_count 0\
-        set max_conn_iterations '"${ITERATIONS_PER_CONNECTION}" "${HAMMERDB_DRIVER}"
-
-# Add reconnect logic inside the transaction loop
-# Find the line with "for {set it 0} {$it < $total_iterations} {incr it}" in the timed section (around line 2343)
-# and add connection cycling logic
-sed -i '/for {set it 0} {$it < $total_iterations} {incr it} {/,/^        }$/ {
-    /incr it} {/a\
-            incr conn_iteration_count\
-            if {$conn_iteration_count >= $max_conn_iterations} {\
-                puts "Reconnecting after $conn_iteration_count transactions..."\
-                catch {mysqlclose $mysql_handler}\
-                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]\
-                if {$prepare} {\
-                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }\
-                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }\
-                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }\
-                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }\
-                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }\
-                }\
-                set conn_iteration_count 0\
-            }
-}' "${HAMMERDB_DRIVER}"
-
-# Add optional delay after each transaction
-if [ -n "${DELAY_CLAUSE}" ]; then
-    # Add delay after each transaction type (after thinktime calls)
-    sed -i 's/\(if { \$KEYANDTHINK } { thinktime [0-9]* }\)/\1\n                '"${DELAY_CLAUSE}"'/g' "${HAMMERDB_DRIVER}"
-fi
-
-log_info "Successfully patched ${HAMMERDB_DRIVER}"
 
 # 8. Run TPC-C test with configured Virtual Users and duration
 TOTAL_DURATION_MINUTES=$((BENCHMARK_DURATION_MINUTES + RAMPUP_DURATION_MINUTES))
