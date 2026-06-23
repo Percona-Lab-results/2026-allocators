@@ -1174,7 +1174,10 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
         #2.4.1.1 set warehouse_id stays constant for a given terminal
         set w_id  [ RandomNumber 1 $w_id_input ]  
         set d_id_input [ list [ mysql::sel $mmysql_handler "select max(d_id) from district" -list ] ]
-        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
+        # Connection cycling: reconnect after max_conn_iterations transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
         puts "Processing $total_iterations transactions without output suppressed..."
         set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
         for {set it 0} {$it < $total_iterations} {incr it} {
@@ -1275,7 +1278,10 @@ mysqlclose $mmysql_handler
             .ed_mainFrame.mainwin.textFrame.left.text fastinsert $index "$timedline \n"
         }
         if { $timedtype eq "async" } {
-            set syncdrvt(3) {for {set it 0} {$it < $total_iterations} {incr it} {
+            set syncdrvt(3) {# Connection cycling: reconnect after max_conn_iterations transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
+        for {set it 0} {$it < $total_iterations} {incr it} {
             incr conn_iteration_count
             if {$conn_iteration_count >= $max_conn_iterations} {
                 puts "Reconnecting after $conn_iteration_count transactions..."
@@ -2382,7 +2388,10 @@ switch $myposition {
         #2.4.1.1 set warehouse_id stays constant for a given terminal
         set w_id  [ RandomNumber 1 $w_id_input ]  
         set d_id_input [ list [ mysql::sel $mysql_handler "select max(d_id) from district" -list ] ]
-        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
+        # Connection cycling: reconnect after max_conn_iterations transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
         puts "Processing $total_iterations transactions with output suppressed..."
         set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
         for {set it 0} {$it < $total_iterations} {incr it} {
@@ -2839,7 +2848,10 @@ switch $myposition {
             #2.4.1.1 set warehouse_id stays constant for a given terminal
             set w_id  [ RandomNumber 1 $w_id_input ]  
             set d_id_input [ list [ mysql::sel $mysql_handler "select max(d_id) from district" -list ] ]
-            set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+            set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
+            # Connection cycling: reconnect after max_conn_iterations transactions
+            set conn_iteration_count 0
+            set max_conn_iterations 1000000
             puts "Processing $total_iterations transactions with output suppressed..."
             set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
             for {set it 0} {$it < $total_iterations} {incr it} {
