@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--delay-us=N]
 #
 # Examples:
 #   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb
-#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=yes --buffer-gb=110 --results-suffix=test2 --binlog=yes --engine=innodb
-#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=no --allocator=tcmalloc --skip-init=no --buffer-gb=64 --results-suffix=test3 --binlog=no --engine=myrocks
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=yes --buffer-gb=110 --results-suffix=test2 --binlog=yes --engine=innodb --delay-us=1000
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=no --allocator=tcmalloc --skip-init=no --buffer-gb=64 --results-suffix=test3 --binlog=no --engine=myrocks --delay-us=500
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
@@ -57,6 +57,7 @@ BUFFER_POOL_SIZE_GB=""
 RESULTS_SUFFIX=""
 ENABLE_BINLOG=""
 STORAGE_ENGINE=""
+DELAY_US="0"
 
 for arg in "$@"; do
     case $arg in
@@ -107,6 +108,10 @@ for arg in "$@"; do
             STORAGE_ENGINE="${arg#*=}"
             shift
             ;;
+        --delay-us=*)
+            DELAY_US="${arg#*=}"
+            shift
+            ;;
         *)
             log_error "Unknown argument: $arg"
             exit 1
@@ -118,8 +123,14 @@ done
 if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
    [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
    [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ]; then
-    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks"
-    log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb"
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--delay-us=N]"
+    log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb --delay-us=1000"
+    exit 1
+fi
+
+# Validate delay is a non-negative integer
+if ! [[ "${DELAY_US}" =~ ^[0-9]+$ ]]; then
+    log_error "Delay must be a non-negative integer (in microseconds), got: ${DELAY_US}"
     exit 1
 fi
 
@@ -639,6 +650,49 @@ if {[catch {vurun} result]} {
 puts "TPC-C TEST STARTED"
 EOF
 
+# 7.5 Patch HammerDB TPC-C driver to add microsecond delay if specified
+if [ "${DELAY_US}" -gt 0 ]; then
+    HAMMERDB_DRIVER="${SCRIPT_DIR}/HammerDB-6.0/src/mysql/mysqltpcc.tcl"
+
+    if [ ! -f "${HAMMERDB_DRIVER}" ]; then
+        log_error "HammerDB TPC-C driver not found at: ${HAMMERDB_DRIVER}"
+        kill ${MYSQLD_PID} 2>/dev/null || true
+        exit 1
+    fi
+
+    # Create backup of original driver
+    if [ ! -f "${HAMMERDB_DRIVER}.orig" ]; then
+        cp "${HAMMERDB_DRIVER}" "${HAMMERDB_DRIVER}.orig"
+        log_info "Created backup of original driver: ${HAMMERDB_DRIVER}.orig"
+    fi
+
+    log_info "Patching HammerDB TPC-C driver to add ${DELAY_US} microsecond delay between transactions..."
+
+    # Convert microseconds to milliseconds for TCL's 'after' command (which takes milliseconds)
+    DELAY_MS=$(awk "BEGIN {printf \"%.3f\", ${DELAY_US}/1000}")
+
+    # Find the main transaction loop and inject delay
+    # Look for the pattern where transactions complete (usually after commit or transaction end)
+    # and inject: after [expr {int($delay_ms)}]
+
+    # Restore original first
+    cp "${HAMMERDB_DRIVER}.orig" "${HAMMERDB_DRIVER}"
+
+    # Inject delay after each transaction iteration in the NEWORD procedure
+    # The pattern typically looks like: } else { break }
+    # We add the delay right after transaction commit
+    sed -i '/mysqlcommit \$mysql/a \        after '"${DELAY_MS}" "${HAMMERDB_DRIVER}"
+
+    log_info "HammerDB driver patched successfully"
+else
+    # Restore original driver if it exists and delay is 0
+    HAMMERDB_DRIVER="${SCRIPT_DIR}/HammerDB-6.0/src/mysql/mysqltpcc.tcl"
+    if [ -f "${HAMMERDB_DRIVER}.orig" ]; then
+        log_info "Restoring original HammerDB driver (no delay requested)..."
+        cp "${HAMMERDB_DRIVER}.orig" "${HAMMERDB_DRIVER}"
+    fi
+fi
+
 # 8. Run TPC-C test with configured Virtual Users and duration
 TOTAL_DURATION_MINUTES=$((BENCHMARK_DURATION_MINUTES + RAMPUP_DURATION_MINUTES))
 BENCHMARK_DURATION_HOURS=$((BENCHMARK_DURATION_MINUTES / 60))
@@ -842,7 +896,7 @@ collect_rss_data() {
 
         # Check if combined RSS exceeds 180GB  (188743680 KB)
         COMBINED_RSS=$((MYSQLD_RSS + HAMMERDB_RSS))
-        RSS_LIMIT_KB=188743680  # 180 GB in KB
+        RSS_LIMIT_KB=$((182 * 1024 * 1024))  # 180 GB in KB
 
         if [ ${COMBINED_RSS} -gt ${RSS_LIMIT_KB} ]; then
             COMBINED_RSS_GB=$((COMBINED_RSS / 1024 / 1024))
@@ -1106,6 +1160,7 @@ log_info "Binary logging: ${ENABLE_BINLOG}"
 log_info "Storage engine: ${STORAGE_ENGINE}"
 log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
+log_info "Keying and thinking delay: ${DELAY_US} microseconds"
 log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
 log_info "Benchmark duration: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
 log_info "Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"
