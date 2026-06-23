@@ -1177,7 +1177,7 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
         set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
         # Connection cycling: reconnect after max_conn_iterations transactions
         set conn_iteration_count 0
-        set max_conn_iterations 1000000
+        set max_conn_iterations [expr {[info exists ::MAX_CONN_ITERATIONS] ? $::MAX_CONN_ITERATIONS : 1000000}]
         puts "Processing $total_iterations transactions without output suppressed..."
         set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
         for {set it 0} {$it < $total_iterations} {incr it} {
@@ -1206,6 +1206,7 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
                 neword $mysql_handler_no $w_id $w_id_input $prepare $RAISEERROR
                 incr nocnt
                 if { $KEYANDTHINK } { thinktime 12 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 20} {
                 puts "payment"
                 if { $KEYANDTHINK } { keytime 3 }
@@ -1215,6 +1216,7 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
                 payment $mysql_handler_py $w_id $w_id_input $prepare $RAISEERROR
                 incr pycnt
                 if { $KEYANDTHINK } { thinktime 12 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 21} {
                 puts "delivery"
                 if { $KEYANDTHINK } { keytime 2 }
@@ -1224,6 +1226,7 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
                 delivery $mysql_handler_dl $w_id $prepare $RAISEERROR
                 incr dlcnt
                 if { $KEYANDTHINK } { thinktime 10 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 22} {
                 puts "stock level"
                 if { $KEYANDTHINK } { keytime 2 }
@@ -1233,6 +1236,7 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
                 slev $mysql_handler_sl $w_id $stock_level_d_id $prepare $RAISEERROR
                 incr slcnt
                 if { $KEYANDTHINK } { thinktime 5 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 23} {
                 puts "order status"
                 if { $KEYANDTHINK } { keytime 2 }
@@ -1242,6 +1246,7 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
                 ostat $mysql_handler_os $w_id $prepare $RAISEERROR
                 incr oscnt
                 if { $KEYANDTHINK } { thinktime 5 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             }
         }
         foreach mysql_handler [ dict values $connlist ] { 
@@ -1280,7 +1285,7 @@ mysqlclose $mmysql_handler
         if { $timedtype eq "async" } {
             set syncdrvt(3) {# Connection cycling: reconnect after max_conn_iterations transactions
         set conn_iteration_count 0
-        set max_conn_iterations 1000000
+        set max_conn_iterations [expr {[info exists ::MAX_CONN_ITERATIONS] ? $::MAX_CONN_ITERATIONS : 1000000}]
         for {set it 0} {$it < $total_iterations} {incr it} {
             incr conn_iteration_count
             if {$conn_iteration_count >= $max_conn_iterations} {
@@ -1307,6 +1312,7 @@ mysqlclose $mmysql_handler
                         neword $mysql_handler_no $w_id $w_id_input $prepare $RAISEERROR $clientname
                         incr nocnt
                         if { $KEYANDTHINK } { async_thinktime 12 $clientname neword $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                     } elseif {$choice <= 20} {
                         if { $async_verbose } { puts "$clientname:w_id:$w_id:payment" }
                         if { $KEYANDTHINK } { async_keytime 3 $clientname payment $async_verbose }
@@ -1316,6 +1322,7 @@ mysqlclose $mmysql_handler
                         payment $mysql_handler_py $w_id $w_id_input $prepare $RAISEERROR $clientname
                         incr pycnt
                         if { $KEYANDTHINK } { async_thinktime 12 $clientname payment $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                     } elseif {$choice <= 21} {
                         if { $async_verbose } { puts "$clientname:w_id:$w_id:delivery" }
                         if { $KEYANDTHINK } { async_keytime 2 $clientname delivery $async_verbose }
@@ -1325,6 +1332,7 @@ mysqlclose $mmysql_handler
                         delivery $mysql_handler_dl $w_id $prepare $RAISEERROR $clientname
                         incr dlcnt
                         if { $KEYANDTHINK } { async_thinktime 10 $clientname delivery $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                     } elseif {$choice <= 22} {
                         if { $async_verbose } { puts "$clientname:w_id:$w_id:slev" }
                         if { $KEYANDTHINK } { async_keytime 2 $clientname slev $async_verbose }
@@ -1334,6 +1342,7 @@ mysqlclose $mmysql_handler
                         slev $mysql_handler_sl $w_id $stock_level_d_id $prepare $RAISEERROR $clientname
                         incr slcnt
                         if { $KEYANDTHINK } { async_thinktime 5 $clientname slev $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                     } elseif {$choice <= 23} {
                         if { $async_verbose } { puts "$clientname:w_id:$w_id:ostat" }
                         if { $KEYANDTHINK } { async_keytime 2 $clientname ostat $async_verbose }
@@ -1343,6 +1352,7 @@ mysqlclose $mmysql_handler
                         ostat $mysql_handler_os $w_id $prepare $RAISEERROR $clientname
                         incr oscnt
                         if { $KEYANDTHINK } { async_thinktime 5 $clientname ostat $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                     }
                 }
             }
@@ -1972,7 +1982,7 @@ set d_id_input [ list [ mysql::sel $mysql_handler "select max(d_id) from distric
 set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
         # Connection cycling: reconnect after ITERATIONS_PER_CONNECTION transactions
         set conn_iteration_count 0
-        set max_conn_iterations 1000000
+        set max_conn_iterations [expr {[info exists ::MAX_CONN_ITERATIONS] ? $::MAX_CONN_ITERATIONS : 1000000}]
 puts "Processing $total_iterations transactions without output suppressed..."
 set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
 for {set it 0} {$it < $total_iterations} {incr it} {
@@ -1997,26 +2007,31 @@ for {set it 0} {$it < $total_iterations} {incr it} {
         if { $KEYANDTHINK } { keytime 18 }
         neword $mysql_handler $w_id $w_id_input $prepare $RAISEERROR
         if { $KEYANDTHINK } { thinktime 12 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
     } elseif {$choice <= 20} {
         puts "payment"
         if { $KEYANDTHINK } { keytime 3 }
         payment $mysql_handler $w_id $w_id_input $prepare $RAISEERROR
         if { $KEYANDTHINK } { thinktime 12 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
     } elseif {$choice <= 21} {
         puts "delivery"
         if { $KEYANDTHINK } { keytime 2 }
         delivery $mysql_handler $w_id $prepare $RAISEERROR
         if { $KEYANDTHINK } { thinktime 10 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
     } elseif {$choice <= 22} {
         puts "stock level"
         if { $KEYANDTHINK } { keytime 2 }
         slev $mysql_handler $w_id $stock_level_d_id $prepare $RAISEERROR
         if { $KEYANDTHINK } { thinktime 5 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
     } elseif {$choice <= 23} {
         puts "order status"
         if { $KEYANDTHINK } { keytime 2 }
         ostat $mysql_handler $w_id $prepare $RAISEERROR
         if { $KEYANDTHINK } { thinktime 5 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
     }
 }
 if {$prepare} {
@@ -2391,7 +2406,7 @@ switch $myposition {
         set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
         # Connection cycling: reconnect after max_conn_iterations transactions
         set conn_iteration_count 0
-        set max_conn_iterations 1000000
+        set max_conn_iterations [expr {[info exists ::MAX_CONN_ITERATIONS] ? $::MAX_CONN_ITERATIONS : 1000000}]
         puts "Processing $total_iterations transactions with output suppressed..."
         set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
         for {set it 0} {$it < $total_iterations} {incr it} {
@@ -2415,22 +2430,27 @@ switch $myposition {
                 if { $KEYANDTHINK } { keytime 18 }
                 neword $mysql_handler $w_id $w_id_input $prepare $RAISEERROR
                 if { $KEYANDTHINK } { thinktime 12 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 20} {
                 if { $KEYANDTHINK } { keytime 3 }
                 payment $mysql_handler $w_id $w_id_input $prepare $RAISEERROR
                 if { $KEYANDTHINK } { thinktime 12 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 21} {
                 if { $KEYANDTHINK } { keytime 2 }
                 delivery $mysql_handler $w_id $prepare $RAISEERROR
                 if { $KEYANDTHINK } { thinktime 10 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 22} {
                 if { $KEYANDTHINK } { keytime 2 }
                 slev $mysql_handler $w_id $stock_level_d_id $prepare $RAISEERROR
                 if { $KEYANDTHINK } { thinktime 5 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             } elseif {$choice <= 23} {
                 if { $KEYANDTHINK } { keytime 2 }
                 ostat $mysql_handler $w_id $prepare $RAISEERROR
                 if { $KEYANDTHINK } { thinktime 5 }
+                if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
             }
         }
         if {$prepare} {
@@ -2851,7 +2871,7 @@ switch $myposition {
             set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
             # Connection cycling: reconnect after max_conn_iterations transactions
             set conn_iteration_count 0
-            set max_conn_iterations 1000000
+            set max_conn_iterations [expr {[info exists ::MAX_CONN_ITERATIONS] ? $::MAX_CONN_ITERATIONS : 1000000}]
             puts "Processing $total_iterations transactions with output suppressed..."
             set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
             for {set it 0} {$it < $total_iterations} {incr it} {
@@ -2876,26 +2896,31 @@ switch $myposition {
                     if { $KEYANDTHINK } { async_keytime 18  $clientname neword $async_verbose }
                     neword $mysql_handler $w_id $w_id_input $prepare $RAISEERROR $clientname
                     if { $KEYANDTHINK } { async_thinktime 12 $clientname neword $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                 } elseif {$choice <= 20} {
                     if { $async_verbose } { puts "$clientname:w_id:$w_id:payment" }
                     if { $KEYANDTHINK } { async_keytime 3 $clientname payment $async_verbose }
                     payment $mysql_handler $w_id $w_id_input $prepare $RAISEERROR $clientname
                     if { $KEYANDTHINK } { async_thinktime 12 $clientname payment $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                 } elseif {$choice <= 21} {
                     if { $async_verbose } { puts "$clientname:w_id:$w_id:delivery" }
                     if { $KEYANDTHINK } { async_keytime 2 $clientname delivery $async_verbose }
                     delivery $mysql_handler $w_id $prepare $RAISEERROR $clientname
                     if { $KEYANDTHINK } { async_thinktime 10 $clientname delivery $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                 } elseif {$choice <= 22} {
                     if { $async_verbose } { puts "$clientname:w_id:$w_id:slev" }
                     if { $KEYANDTHINK } { async_keytime 2 $clientname slev $async_verbose }
                     slev $mysql_handler $w_id $stock_level_d_id $prepare $RAISEERROR $clientname
                     if { $KEYANDTHINK } { async_thinktime 5 $clientname slev $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                 } elseif {$choice <= 23} {
                     if { $async_verbose } { puts "$clientname:w_id:$w_id:ostat" }
                     if { $KEYANDTHINK } { async_keytime 2 $clientname ostat $async_verbose }
                     ostat $mysql_handler $w_id $prepare $RAISEERROR $clientname
                     if { $KEYANDTHINK } { async_thinktime 5 $clientname ostat $async_verbose }
+                        if {[info exists ::TRANSACTION_DELAY_MS] && $::TRANSACTION_DELAY_MS > 0} { after $::TRANSACTION_DELAY_MS }
                 }
             }
             if {$prepare} {
