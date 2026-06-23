@@ -610,6 +610,11 @@ HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
 
 cat > "${HAMMERDB_RUN_TCL}" <<EOF
 #!/usr/bin/tclsh
+
+# Source custom OLTP driver with connection cycling
+puts "Loading custom OLTP driver: ${SCRIPT_DIR}/mysqloltp.tcl"
+source ${SCRIPT_DIR}/mysqloltp.tcl
+
 puts "SETTING CONFIGURATION FOR TPC-C RUN"
 dbset db mysql
 dbset bm TPC-C
@@ -650,47 +655,22 @@ if {[catch {vurun} result]} {
 puts "TPC-C TEST STARTED"
 EOF
 
-# 7.5 Patch HammerDB TPC-C driver to add microsecond delay if specified
+# 7.5 Verify mysqloltp.tcl exists (already manually patched with connection cycling)
+HAMMERDB_DRIVER="${SCRIPT_DIR}/mysqloltp.tcl"
+
+if [ ! -f "${HAMMERDB_DRIVER}" ]; then
+    log_error "mysqloltp.tcl not found at: ${HAMMERDB_DRIVER}"
+    log_error "Please ensure mysqloltp.tcl exists in the current directory"
+    log_error "This file should be manually patched with connection cycling logic"
+    kill ${MYSQLD_PID} 2>/dev/null || true
+    exit 1
+fi
+
+log_info "Using manually patched mysqloltp.tcl with connection cycling"
 if [ "${DELAY_US}" -gt 0 ]; then
-    HAMMERDB_DRIVER="${SCRIPT_DIR}/HammerDB-6.0/src/mysql/mysqltpcc.tcl"
-
-    if [ ! -f "${HAMMERDB_DRIVER}" ]; then
-        log_error "HammerDB TPC-C driver not found at: ${HAMMERDB_DRIVER}"
-        kill ${MYSQLD_PID} 2>/dev/null || true
-        exit 1
-    fi
-
-    # Create backup of original driver
-    if [ ! -f "${HAMMERDB_DRIVER}.orig" ]; then
-        cp "${HAMMERDB_DRIVER}" "${HAMMERDB_DRIVER}.orig"
-        log_info "Created backup of original driver: ${HAMMERDB_DRIVER}.orig"
-    fi
-
-    log_info "Patching HammerDB TPC-C driver to add ${DELAY_US} microsecond delay between transactions..."
-
-    # Convert microseconds to milliseconds for TCL's 'after' command (which takes milliseconds)
-    DELAY_MS=$(awk "BEGIN {printf \"%.3f\", ${DELAY_US}/1000}")
-
-    # Find the main transaction loop and inject delay
-    # Look for the pattern where transactions complete (usually after commit or transaction end)
-    # and inject: after [expr {int($delay_ms)}]
-
-    # Restore original first
-    cp "${HAMMERDB_DRIVER}.orig" "${HAMMERDB_DRIVER}"
-
-    # Inject delay after each transaction iteration in the NEWORD procedure
-    # The pattern typically looks like: } else { break }
-    # We add the delay right after transaction commit
-    sed -i '/mysqlcommit \$mysql/a \        after '"${DELAY_MS}" "${HAMMERDB_DRIVER}"
-
-    log_info "HammerDB driver patched successfully"
-else
-    # Restore original driver if it exists and delay is 0
-    HAMMERDB_DRIVER="${SCRIPT_DIR}/HammerDB-6.0/src/mysql/mysqltpcc.tcl"
-    if [ -f "${HAMMERDB_DRIVER}.orig" ]; then
-        log_info "Restoring original HammerDB driver (no delay requested)..."
-        cp "${HAMMERDB_DRIVER}.orig" "${HAMMERDB_DRIVER}"
-    fi
+    DELAY_MS=$((DELAY_US / 1000))
+    [ "${DELAY_MS}" -eq 0 ] && DELAY_MS=1
+    log_info "Transaction delay: ${DELAY_US} microseconds (${DELAY_MS} ms) - ensure mysqloltp.tcl is patched with delay support"
 fi
 
 # 8. Run TPC-C test with configured Virtual Users and duration
