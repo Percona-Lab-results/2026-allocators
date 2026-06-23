@@ -605,14 +605,27 @@ fi
 # Create results directory
 mkdir -p "${RESULTS_DIR}"
 
+# Calculate delay in milliseconds for TCL
+DELAY_MS=0
+if [ "${DELAY_US}" -gt 0 ]; then
+    DELAY_MS=$((DELAY_US / 1000))
+    [ "${DELAY_MS}" -eq 0 ] && DELAY_MS=1
+fi
+
 # Create HammerDB run script for TPC-C test
 HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
 
 cat > "${HAMMERDB_RUN_TCL}" <<EOF
 #!/usr/bin/tclsh
 
+# Set global variables for custom OLTP driver
+set ::TRANSACTION_DELAY_MS ${DELAY_MS}
+set ::MAX_CONN_ITERATIONS 1000000
+
 # Source custom OLTP driver with connection cycling
 puts "Loading custom OLTP driver: ${SCRIPT_DIR}/mysqloltp.tcl"
+puts "  Transaction delay: ${DELAY_MS} ms"
+puts "  Connection cycling: 1,000,000 iterations per connection"
 source ${SCRIPT_DIR}/mysqloltp.tcl
 
 puts "SETTING CONFIGURATION FOR TPC-C RUN"
@@ -668,9 +681,7 @@ fi
 
 log_info "Using manually patched mysqloltp.tcl with connection cycling"
 if [ "${DELAY_US}" -gt 0 ]; then
-    DELAY_MS=$((DELAY_US / 1000))
-    [ "${DELAY_MS}" -eq 0 ] && DELAY_MS=1
-    log_info "Transaction delay: ${DELAY_US} microseconds (${DELAY_MS} ms) - ensure mysqloltp.tcl is patched with delay support"
+    log_info "Transaction delay: ${DELAY_US} microseconds (${DELAY_MS} ms) - passed to mysqloltp.tcl via TRANSACTION_DELAY_MS variable"
 fi
 
 # 8. Run TPC-C test with configured Virtual Users and duration
