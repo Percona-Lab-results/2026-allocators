@@ -47,6 +47,7 @@ ulimit -n 65536
 log_info "Killing any existing mysqld processes..."
 sudo killall mysqld 2>/dev/null || true
 sleep 2
+sudo killall vmstat mpstat iostat 2>/dev/null || true
 
 # Parse named command line arguments
 SERVER_BINARY=""
