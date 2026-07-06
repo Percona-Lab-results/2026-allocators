@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--delay-us=N] [--connection-pool=yes|no]
 #
 # Examples:
 #   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb
-#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=yes --buffer-gb=110 --results-suffix=test2 --binlog=yes --engine=innodb
-#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=no --allocator=tcmalloc --skip-init=no --buffer-gb=64 --results-suffix=test3 --binlog=no --engine=myrocks
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=yes --buffer-gb=110 --results-suffix=test2 --binlog=yes --engine=innodb --delay-us=1000
+#   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=no --allocator=tcmalloc --skip-init=no --buffer-gb=64 --results-suffix=test3 --binlog=no --engine=myrocks --delay-us=500 --connection-pool=yes
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DATA_DIR="${HOME}/servers/data"
@@ -57,6 +57,8 @@ BUFFER_POOL_SIZE_GB=""
 RESULTS_SUFFIX=""
 ENABLE_BINLOG=""
 STORAGE_ENGINE=""
+DELAY_US="0"
+CONNECTION_POOL=""
 
 for arg in "$@"; do
     case $arg in
@@ -107,6 +109,19 @@ for arg in "$@"; do
             STORAGE_ENGINE="${arg#*=}"
             shift
             ;;
+        --delay-us=*)
+            DELAY_US="${arg#*=}"
+            shift
+            ;;
+        --connection-pool=*)
+            POOL_VALUE="${arg#*=}"
+            case $POOL_VALUE in
+                yes) CONNECTION_POOL="pool" ;;
+                no) CONNECTION_POOL="nopool" ;;
+                *) log_error "Invalid --connection-pool value: $POOL_VALUE (must be yes or no)"; exit 1 ;;
+            esac
+            shift
+            ;;
         *)
             log_error "Unknown argument: $arg"
             exit 1
@@ -117,14 +132,26 @@ done
 # Check that all required arguments are provided
 if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
    [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
-   [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ]; then
-    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks"
-    log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb"
+   [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ] || [ -z "${CONNECTION_POOL}" ]; then
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks --connection-pool=yes|no [--delay-us=N]"
+    log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb --connection-pool=no --delay-us=1000"
+    exit 1
+fi
+
+# Validate delay is a non-negative integer
+if ! [[ "${DELAY_US}" =~ ^[0-9]+$ ]]; then
+    log_error "Delay must be a non-negative integer (in microseconds), got: ${DELAY_US}"
+    exit 1
+fi
+
+# Validate connection pool parameter
+if [[ ! "${CONNECTION_POOL}" =~ ^(pool|nopool)$ ]]; then
+    log_error "Connection pool parameter must be 'pool' or 'nopool', got: ${CONNECTION_POOL}"
     exit 1
 fi
 
 # Set results directory with suffix and parameters
-RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}-${STORAGE_ENGINE}"
+RESULTS_DIR="${SCRIPT_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${ALLOCATOR}-${BUFFER_POOL_SIZE_GB}G-${ENABLE_BINLOG}-${STORAGE_ENGINE}-${CONNECTION_POOL}"
 
 # Validate inputs
 if [ ! -f "${SERVER_BINARY}" ]; then
@@ -220,6 +247,7 @@ done
 log_info "Creating MySQL configuration file: ${MY_CNF}"
 log_info "Storage engine: ${STORAGE_ENGINE}"
 log_info "Binary logging: ${ENABLE_BINLOG}"
+log_info "Connection pool (thread pool): ${CONNECTION_POOL}"
 
 cat > "${MY_CNF}" <<EOF
 [mysqld]
@@ -228,6 +256,21 @@ cat > "${MY_CNF}" <<EOF
 # Data directory
 datadir=${SERVER_DATA_DIR}
 
+EOF
+
+# Add thread pool configuration if enabled
+if [ "${CONNECTION_POOL}" = "pool" ]; then
+    cat >> "${MY_CNF}" <<EOF
+# Thread Pool / Connection Pool
+plugin-load-add=thread_pool.so
+thread_pool_size=16
+thread_pool_max_threads=5000
+thread_pool_stall_limit=500
+
+EOF
+fi
+
+cat >> "${MY_CNF}" <<EOF
 EOF
 
 # Add binary logging configuration based on parameter
@@ -599,6 +642,11 @@ HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
 
 cat > "${HAMMERDB_RUN_TCL}" <<EOF
 #!/usr/bin/tclsh
+
+# Source custom OLTP driver with connection cycling
+puts "Loading custom OLTP driver: ${SCRIPT_DIR}/mysqloltp.tcl"
+source ${SCRIPT_DIR}/mysqloltp.tcl
+
 puts "SETTING CONFIGURATION FOR TPC-C RUN"
 dbset db mysql
 dbset bm TPC-C
@@ -619,6 +667,23 @@ diset tpcc mysql_allwarehouse true
 diset tpcc mysql_timeprofile true
 diset tpcc mysql_history_pk true
 diset tpcc mysql_total_iterations 100000000
+EOF
+
+# Add delay configuration if specified
+if [ "${DELAY_US}" -gt 0 ]; then
+    # Convert microseconds to milliseconds for HammerDB
+    DELAY_MS=$((DELAY_US / 1000))
+    # Ensure at least 1ms if delay was specified but less than 1000us
+    if [ "${DELAY_MS}" -eq 0 ]; then
+        DELAY_MS=1
+    fi
+
+    cat >> "${HAMMERDB_RUN_TCL}" <<EOF
+diset tpcc mysql_async_delay ${DELAY_MS}
+EOF
+fi
+
+cat >> "${HAMMERDB_RUN_TCL}" <<EOF
 
 puts "Printing current configuration..."
 print dict
@@ -638,6 +703,24 @@ if {[catch {vurun} result]} {
 
 puts "TPC-C TEST STARTED"
 EOF
+
+# 7.5 Verify mysqloltp.tcl exists (already manually patched with connection cycling)
+HAMMERDB_DRIVER="${SCRIPT_DIR}/mysqloltp.tcl"
+
+if [ ! -f "${HAMMERDB_DRIVER}" ]; then
+    log_error "mysqloltp.tcl not found at: ${HAMMERDB_DRIVER}"
+    log_error "Please ensure mysqloltp.tcl exists in the current directory"
+    log_error "This file should be manually patched with connection cycling logic"
+    kill ${MYSQLD_PID} 2>/dev/null || true
+    exit 1
+fi
+
+log_info "Using manually patched mysqloltp.tcl with connection cycling"
+if [ "${DELAY_US}" -gt 0 ]; then
+    DELAY_MS=$((DELAY_US / 1000))
+    [ "${DELAY_MS}" -eq 0 ] && DELAY_MS=1
+    log_info "Transaction delay: ${DELAY_US} microseconds (${DELAY_MS} ms) - ensure mysqloltp.tcl is patched with delay support"
+fi
 
 # 8. Run TPC-C test with configured Virtual Users and duration
 TOTAL_DURATION_MINUTES=$((BENCHMARK_DURATION_MINUTES + RAMPUP_DURATION_MINUTES))
@@ -1104,8 +1187,17 @@ log_info "THP enabled: ${THP_ENABLED}"
 log_info "Buffer pool size: ${BUFFER_POOL_SIZE_GB}G"
 log_info "Binary logging: ${ENABLE_BINLOG}"
 log_info "Storage engine: ${STORAGE_ENGINE}"
+log_info "Connection pool (thread pool): ${CONNECTION_POOL}"
 log_info "Results suffix: ${RESULTS_SUFFIX}"
 log_info "Virtual Users: ${VIRTUAL_USERS}"
+log_info "Connection cycling: enabled (1,000,000 iterations per connection)"
+if [ "${DELAY_US}" -gt 0 ]; then
+    DELAY_MS=$((DELAY_US / 1000))
+    [ "${DELAY_MS}" -eq 0 ] && DELAY_MS=1
+    log_info "Transaction delay: ${DELAY_US} microseconds (${DELAY_MS} ms)"
+else
+    log_info "Transaction delay: 0 (no delay)"
+fi
 log_info "Ramp-up duration: ${RAMPUP_DURATION_MINUTES} minutes"
 log_info "Benchmark duration: ${BENCHMARK_DURATION_MINUTES} minutes (${BENCHMARK_DURATION_HOURS} hours)"
 log_info "Total duration: ${TOTAL_DURATION_MINUTES} minutes (${TOTAL_DURATION_HOURS} hours)"

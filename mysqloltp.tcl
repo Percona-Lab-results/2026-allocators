@@ -1174,10 +1174,27 @@ proc insert_mysqlconnectpool_drivescript { testtype timedtype } {
         #2.4.1.1 set warehouse_id stays constant for a given terminal
         set w_id  [ RandomNumber 1 $w_id_input ]  
         set d_id_input [ list [ mysql::sel $mmysql_handler "select max(d_id) from district" -list ] ]
-        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
+        # Connection cycling: reconnect after max_conn_iterations transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
         puts "Processing $total_iterations transactions without output suppressed..."
         set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
         for {set it 0} {$it < $total_iterations} {incr it} {
+            incr conn_iteration_count
+            if {$conn_iteration_count >= $max_conn_iterations} {
+                puts "Reconnecting after $conn_iteration_count transactions..."
+                catch {mysqlclose $mysql_handler}
+                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]
+                if {$prepare} {
+                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }
+                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }
+                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }
+                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }
+                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }
+                }
+                set conn_iteration_count 0
+            }
             if { [expr {$it % $abchk}] eq 0 } { if { [ time {if {  [ tsv::get application abort ]  } { break }} ] > $hi_t }  {  set  abchk [ expr {min(($abchk * 2), $abchk_mx)}]; set hi_t [ expr {$hi_t * 2} ] } }
             set choice [ RandomNumber 1 23 ]
             if {$choice <= 10} {
@@ -1261,7 +1278,24 @@ mysqlclose $mmysql_handler
             .ed_mainFrame.mainwin.textFrame.left.text fastinsert $index "$timedline \n"
         }
         if { $timedtype eq "async" } {
-            set syncdrvt(3) {for {set it 0} {$it < $total_iterations} {incr it} {
+            set syncdrvt(3) {# Connection cycling: reconnect after max_conn_iterations transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
+        for {set it 0} {$it < $total_iterations} {incr it} {
+            incr conn_iteration_count
+            if {$conn_iteration_count >= $max_conn_iterations} {
+                puts "Reconnecting after $conn_iteration_count transactions..."
+                catch {mysqlclose $mysql_handler}
+                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]
+                if {$prepare} {
+                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }
+                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }
+                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }
+                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }
+                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }
+                }
+                set conn_iteration_count 0
+            }
                     if { [expr {$it % $abchk}] eq 0 } { if { [ time {if {  [ tsv::get application abort ]  } { break }} ] > $hi_t }  {  set  abchk [ expr {min(($abchk * 2), $abchk_mx)}]; set hi_t [ expr {$hi_t * 2} ] } }
                     set choice [ RandomNumber 1 23 ]
                     if {$choice <= 10} {
@@ -1936,9 +1970,26 @@ set w_id_input [ list [ mysql::sel $mysql_handler "select max(w_id) from warehou
 set w_id  [ RandomNumber 1 $w_id_input ]  
 set d_id_input [ list [ mysql::sel $mysql_handler "select max(d_id) from district" -list ] ]
 set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+        # Connection cycling: reconnect after ITERATIONS_PER_CONNECTION transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
 puts "Processing $total_iterations transactions without output suppressed..."
 set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
 for {set it 0} {$it < $total_iterations} {incr it} {
+            incr conn_iteration_count
+            if {$conn_iteration_count >= $max_conn_iterations} {
+                puts "Reconnecting after $conn_iteration_count transactions..."
+                catch {mysqlclose $mysql_handler}
+                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]
+                if {$prepare} {
+                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }
+                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }
+                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }
+                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }
+                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }
+                }
+                set conn_iteration_count 0
+            }
     if { [expr {$it % $abchk}] eq 0 } { if { [ time {if {  [ tsv::get application abort ]  } { break }} ] > $hi_t }  {  set  abchk [ expr {min(($abchk * 2), $abchk_mx)}]; set hi_t [ expr {$hi_t * 2} ] } }
     set choice [ RandomNumber 1 23 ]
     if {$choice <= 10} {
@@ -2337,10 +2388,27 @@ switch $myposition {
         #2.4.1.1 set warehouse_id stays constant for a given terminal
         set w_id  [ RandomNumber 1 $w_id_input ]  
         set d_id_input [ list [ mysql::sel $mysql_handler "select max(d_id) from district" -list ] ]
-        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+        set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
+        # Connection cycling: reconnect after max_conn_iterations transactions
+        set conn_iteration_count 0
+        set max_conn_iterations 1000000
         puts "Processing $total_iterations transactions with output suppressed..."
         set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
         for {set it 0} {$it < $total_iterations} {incr it} {
+            incr conn_iteration_count
+            if {$conn_iteration_count >= $max_conn_iterations} {
+                puts "Reconnecting after $conn_iteration_count transactions..."
+                catch {mysqlclose $mysql_handler}
+                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]
+                if {$prepare} {
+                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }
+                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }
+                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }
+                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }
+                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }
+                }
+                set conn_iteration_count 0
+            }
             if { [expr {$it % $abchk}] eq 0 } { if { [ time {if {  [ tsv::get application abort ]  } { break }} ] > $hi_t }  {  set  abchk [ expr {min(($abchk * 2), $abchk_mx)}]; set hi_t [ expr {$hi_t * 2} ] } }
             set choice [ RandomNumber 1 23 ]
             if {$choice <= 10} {
@@ -2780,10 +2848,27 @@ switch $myposition {
             #2.4.1.1 set warehouse_id stays constant for a given terminal
             set w_id  [ RandomNumber 1 $w_id_input ]  
             set d_id_input [ list [ mysql::sel $mysql_handler "select max(d_id) from district" -list ] ]
-            set stock_level_d_id  [ RandomNumber 1 $d_id_input ]  
+            set stock_level_d_id  [ RandomNumber 1 $d_id_input ]
+            # Connection cycling: reconnect after max_conn_iterations transactions
+            set conn_iteration_count 0
+            set max_conn_iterations 1000000
             puts "Processing $total_iterations transactions with output suppressed..."
             set abchk 1; set abchk_mx 1024; set hi_t [ expr {pow([ lindex [ time {if {  [ tsv::get application abort ]  } { break }} ] 0 ],2)}]
             for {set it 0} {$it < $total_iterations} {incr it} {
+            incr conn_iteration_count
+            if {$conn_iteration_count >= $max_conn_iterations} {
+                puts "Reconnecting after $conn_iteration_count transactions..."
+                catch {mysqlclose $mysql_handler}
+                set mysql_handler [ ConnectToMySQL $host $port $socket $ssl_options $user $password $db ]
+                if {$prepare} {
+                    catch { set stid_neword [ prep_statement $mysql_handler "set @no_w_id=?,@w_id_input=?,@no_d_id=?,@no_c_id=?,@ol_cnt=?,@next_o_id=?,@date=?" ] }
+                    catch { set stid_payment [ prep_statement $mysql_handler "set @p_w_id=?,@p_d_id=?,@p_c_w_id=?,@p_c_d_id=?,@p_c_id=?,@byname=?,@p_h_amount=?,@p_c_last=?,@p_c_credit=?,@p_c_balance=?,@h_date=?" ] }
+                    catch { set stid_delivery [ prep_statement $mysql_handler "set @d_w_id=?,@d_o_carrier_id=?,@timestamp=?" ] }
+                    catch { set stid_slev [ prep_statement $mysql_handler "set @st_w_id=?,@st_d_id=?,@threshold=?" ] }
+                    catch { set stid_ostat [ prep_statement $mysql_handler "set @os_w_id=?,@os_d_id=?,@os_c_id=?,@byname=?,@os_c_last=?" ] }
+                }
+                set conn_iteration_count 0
+            }
                 if { [expr {$it % $abchk}] eq 0 } { if { [ time {if {  [ tsv::get application abort ]  } { break }} ] > $hi_t }  {  set  abchk [ expr {min(($abchk * 2), $abchk_mx)}]; set hi_t [ expr {$hi_t * 2} ] } }
                 set choice [ RandomNumber 1 23 ]
                 if {$choice <= 10} {
