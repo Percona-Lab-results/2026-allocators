@@ -14,7 +14,7 @@ SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
 MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
-BENCHMARK_DURATION_MINUTES=1200  # 20 hours = 1200 minutes
+BENCHMARK_DURATION_MINUTES=3600  # 60 hours = 3600 minutes
 RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
 
