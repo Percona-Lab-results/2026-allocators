@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--mem-report=gdb|sql]
 #
 # Examples:
 #   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb
@@ -57,6 +57,7 @@ BUFFER_POOL_SIZE_GB=""
 RESULTS_SUFFIX=""
 ENABLE_BINLOG=""
 STORAGE_ENGINE=""
+MEM_REPORT="gdb"
 
 for arg in "$@"; do
     case $arg in
@@ -107,6 +108,14 @@ for arg in "$@"; do
             STORAGE_ENGINE="${arg#*=}"
             shift
             ;;
+        --mem-report=*)
+            MEM_REPORT="${arg#*=}"
+            case $MEM_REPORT in
+                gdb|sql) ;;
+                *) log_error "Invalid --mem-report value: $MEM_REPORT (must be gdb or sql)"; exit 1 ;;
+            esac
+            shift
+            ;;
         *)
             log_error "Unknown argument: $arg"
             exit 1
@@ -118,7 +127,7 @@ done
 if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
    [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
    [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ]; then
-    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks"
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--mem-report=gdb|sql]"
     log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb"
     exit 1
 fi
@@ -670,6 +679,7 @@ trap_handler() {
     [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
     [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
     [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+    [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
 
     # Stop MySQL
     if kill -0 ${MYSQLD_PID} 2>/dev/null; then
@@ -711,6 +721,7 @@ GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
 VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
 IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
 MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
+MALLOC_INFO_FILE="${RESULTS_DIR}/${FILE_PREFIX}_malloc_info_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -757,6 +768,10 @@ echo "" >> "${IOSTAT_FILE}"
 echo "# mpstat per-CPU statistics (every 1 second)" > "${MPSTAT_FILE}"
 echo "# Started at: $(date)" >> "${MPSTAT_FILE}"
 echo "" >> "${MPSTAT_FILE}"
+
+echo "# Memory statistics for mysqld, allocator=${ALLOCATOR}, method=${MEM_REPORT} (every 2 minutes)" > "${MALLOC_INFO_FILE}"
+echo "# Started at: $(date)" >> "${MALLOC_INFO_FILE}"
+echo "" >> "${MALLOC_INFO_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -862,6 +877,7 @@ collect_rss_data() {
             [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
             [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
             [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+            [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
 
             exit 1
         fi
@@ -939,6 +955,80 @@ collect_iostat() {
     kill ${iostat_pid} 2>/dev/null || true
 }
 
+# Memory statistics collection (every 2 minutes), method set by --mem-report:
+#   sql - SELECT * FROM sys.memory_global_total (performance_schema
+#         instrumented memory, no process stop, but excludes untracked
+#         allocations and allocator overhead/fragmentation)
+#   gdb - allocator-internal stats via gdb inferior calls:
+#     glibc    - malloc_info(0, fp) writes XML to a FILE* the target fopen()s
+#                in append mode (stderr would land in the MySQL error log)
+#     jemalloc - malloc_stats_print() writes to stderr only, so fd 2 is
+#                temporarily redirected to the results file around the call
+#     tcmalloc - MallocExtension_GetStats() fills a caller-supplied buffer,
+#                which is then fputs()'d to the results file
+collect_malloc_info() {
+    local pid=$1
+    local hammerdb_pid=$2
+    local malloc_info_file=$3
+    local allocator=$4
+    local mem_report=$5
+
+    local iteration=0
+
+    while kill -0 ${pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        if [ $((iteration % 120)) -eq 0 ]; then
+            TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+            echo "=== ${TIMESTAMP} ===" >> "${malloc_info_file}"
+
+            if [ "${mem_report}" = "sql" ]; then
+                "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+                    -e "SELECT * FROM sys.memory_global_total;" \
+                    >> "${malloc_info_file}" 2>/dev/null || true
+            else
+            # timeout: kill a hung gdb (inferior call blocked on an allocator
+            # lock) so mysqld resumes; --readnever: skip loading mysqld debug
+            # info, the calls only need dynamic symbols
+            case "${allocator}" in
+                glibc)
+                    sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
+                        -ex "set \$fp = (void *) fopen(\"${malloc_info_file}\", \"a\")" \
+                        -ex "call (int) malloc_info(0, \$fp)" \
+                        -ex "call (int) fclose(\$fp)" \
+                        > /dev/null 2>&1 || true
+                    ;;
+                jemalloc36|jemalloc53)
+                    # open() flags: O_WRONLY|O_CREAT|O_APPEND = 1089
+                    sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
+                        -ex "set \$old = (int) dup(2)" \
+                        -ex "set \$fd = (int) open(\"${malloc_info_file}\", 1089, 0644)" \
+                        -ex "call (int) dup2(\$fd, 2)" \
+                        -ex "call (void) malloc_stats_print(0, 0, \"abl\")" \
+                        -ex "call (int) dup2(\$old, 2)" \
+                        -ex "call (int) close(\$fd)" \
+                        -ex "call (int) close(\$old)" \
+                        > /dev/null 2>&1 || true
+                    ;;
+                tcmalloc)
+                    sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
+                        -ex "set \$buf = (char *) malloc(131072)" \
+                        -ex "call (void) MallocExtension_GetStats(\$buf, 131072)" \
+                        -ex "set \$fp = (void *) fopen(\"${malloc_info_file}\", \"a\")" \
+                        -ex "call (int) fputs(\$buf, \$fp)" \
+                        -ex "call (int) fclose(\$fp)" \
+                        -ex "call (void) free(\$buf)" \
+                        > /dev/null 2>&1 || true
+                    ;;
+            esac
+            fi
+
+            echo "" >> "${malloc_info_file}"
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 1
+    done
+}
+
 # mpstat per-CPU statistics monitoring function
 collect_mpstat() {
     local mpstat_file=$1
@@ -963,6 +1053,7 @@ MYSQL_GLOBALS_PID=""
 VMSTAT_PID=""
 IOSTAT_PID=""
 MPSTAT_PID=""
+MALLOC_INFO_PID=""
 
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
@@ -988,6 +1079,10 @@ IOSTAT_PID=$!
 collect_mpstat "${MPSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
 MPSTAT_PID=$!
 
+# Start memory statistics collection in background
+collect_malloc_info ${MYSQLD_PID} ${HAMMERDB_PID} "${MALLOC_INFO_FILE}" "${ALLOCATOR}" "${MEM_REPORT}" &
+MALLOC_INFO_PID=$!
+
 # Time reporting loop
 LAST_REPORT=0
 while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
@@ -1010,6 +1105,7 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
         [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
         [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+        [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
         exit 1
     fi
 
@@ -1072,6 +1168,9 @@ HAMMERDB_EXIT=$?
 [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
 [ -n "${MPSTAT_PID}" ] && wait ${MPSTAT_PID} 2>/dev/null || true
 
+[ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
+[ -n "${MALLOC_INFO_PID}" ] && wait ${MALLOC_INFO_PID} 2>/dev/null || true
+
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
 # Stop MySQL server
@@ -1122,6 +1221,7 @@ log_info "  - MySQL global variables data: ${GLOBAL_VARS_FILE}"
 log_info "  - vmstat system statistics: ${VMSTAT_FILE}"
 log_info "  - iostat disk statistics: ${IOSTAT_FILE}"
 log_info "  - mpstat per-CPU statistics: ${MPSTAT_FILE}"
+log_info "  - Memory statistics (${MEM_REPORT}): ${MALLOC_INFO_FILE}"
 if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log" ]; then
     log_info "  - HammerDB transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
 fi
