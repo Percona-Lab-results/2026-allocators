@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--mem-report=gdb|sql]
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--mem-report=gdb|sql] [--duration=N]
+#
+# Optional: --duration=N sets the benchmark duration in minutes (default: 1200)
 #
 # Examples:
 #   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb
@@ -14,7 +16,7 @@ SERVER_DATA_DIR="${HOME}/servers/data"
 MY_CNF="${SCRIPT_DIR}/my.cnf"
 HAMMERDB_LOAD_TCL="${SCRIPT_DIR}/hammerdb_load.tcl"
 MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
-BENCHMARK_DURATION_MINUTES=3600  # 60 hours = 3600 minutes
+BENCHMARK_DURATION_MINUTES=1200  # Default: 20 hours = 1200 minutes (override with --duration=N)
 RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
 
@@ -116,6 +118,14 @@ for arg in "$@"; do
             esac
             shift
             ;;
+        --duration=*)
+            BENCHMARK_DURATION_MINUTES="${arg#*=}"
+            if ! [[ "${BENCHMARK_DURATION_MINUTES}" =~ ^[0-9]+$ ]] || [ "${BENCHMARK_DURATION_MINUTES}" -lt 1 ]; then
+                log_error "Invalid --duration value: ${BENCHMARK_DURATION_MINUTES} (must be a positive integer, in minutes)"
+                exit 1
+            fi
+            shift
+            ;;
         *)
             log_error "Unknown argument: $arg"
             exit 1
@@ -127,7 +137,7 @@ done
 if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
    [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
    [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ]; then
-    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--mem-report=gdb|sql]"
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--mem-report=gdb|sql] [--duration=N]"
     log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb"
     exit 1
 fi
@@ -225,10 +235,14 @@ for cpu_idle in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
     fi
 done
 
+# MySQL session timeouts: twice the benchmark duration (in seconds)
+MYSQL_TIMEOUT_SECONDS=$((BENCHMARK_DURATION_MINUTES * 2 * 60))
+
 # 3. Create Server configuration file my.cnf
 log_info "Creating MySQL configuration file: ${MY_CNF}"
 log_info "Storage engine: ${STORAGE_ENGINE}"
 log_info "Binary logging: ${ENABLE_BINLOG}"
+log_info "wait_timeout / interactive_timeout: ${MYSQL_TIMEOUT_SECONDS} seconds"
 
 cat > "${MY_CNF}" <<EOF
 [mysqld]
@@ -278,8 +292,8 @@ require_secure_transport = OFF
 
 # Other settings
 sql_mode = ""
-wait_timeout = 288000        # 80 hours
-interactive_timeout = 288000 # 80 hours
+wait_timeout = ${MYSQL_TIMEOUT_SECONDS}        # 2x benchmark duration
+interactive_timeout = ${MYSQL_TIMEOUT_SECONDS} # 2x benchmark duration
 EOF
 
 # Storage engine configuration
