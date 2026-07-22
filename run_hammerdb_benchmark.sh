@@ -444,15 +444,30 @@ elif [ "${ALLOCATOR}" = "tcmalloc" ]; then
     fi
 fi
 
+# jemalloc heap profiling: enable sampled allocation profiling in mysqld so
+# a full profile (call stacks + bytes currently kept) can be dumped on demand.
+# lg_prof_sample:19 = one sample per ~512KiB allocated (jemalloc default,
+# negligible overhead). Dumps are triggered every 5 minutes by
+# collect_jemalloc_prof below. MALLOC_CONF is set only on the mysqld command
+# so hammerdbcli/mysql client (which inherit LD_PRELOAD) don't also dump.
+# Note: requires a jemalloc built with --enable-prof; if not (e.g. some
+# bundled jemalloc 3.6 builds), prof.dump fails and is logged, nothing else
+# breaks.
+JEMALLOC_PROF_DIR="${RESULTS_DIR}/jeprof"
+MYSQLD_MALLOC_CONF=""
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    mkdir -p "${JEMALLOC_PROF_DIR}"
+    MYSQLD_MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:19,prof_prefix:${JEMALLOC_PROF_DIR}/jeprof"
+    log_info "jemalloc heap profiling enabled: MALLOC_CONF=${MYSQLD_MALLOC_CONF}"
+fi
+
 # Start MySQL server
 log_info "Starting MySQL server..."
-if [ -n "${MYSQLD_LD_LIBRARY_PATH}" ]; then
-    log_info "Command: LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH} ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
-    LD_LIBRARY_PATH="${MYSQLD_LD_LIBRARY_PATH}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
-else
-    log_info "Command: ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
-    "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
-fi
+MYSQLD_ENV=()
+[ -n "${MYSQLD_LD_LIBRARY_PATH}" ] && MYSQLD_ENV+=("LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH}")
+[ -n "${MYSQLD_MALLOC_CONF}" ] && MYSQLD_ENV+=("MALLOC_CONF=${MYSQLD_MALLOC_CONF}")
+log_info "Command: ${MYSQLD_ENV[*]} ${SERVER_BINARY} --defaults-file=${MY_CNF} --user=$(whoami)"
+env "${MYSQLD_ENV[@]}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
 MYSQLD_PID=$!
 
 # Set OOM score adjustment to protect mysqld from OOM killer
@@ -694,6 +709,7 @@ trap_handler() {
     [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
     [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
     [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
+    [ -n "${JEPROF_PID}" ] && kill ${JEPROF_PID} 2>/dev/null || true
 
     # Stop MySQL
     if kill -0 ${MYSQLD_PID} 2>/dev/null; then
@@ -736,6 +752,7 @@ VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
 IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
 MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
 MALLOC_INFO_FILE="${RESULTS_DIR}/${FILE_PREFIX}_malloc_info_${DATE_TIME}.log"
+JEPROF_LOG_FILE="${RESULTS_DIR}/${FILE_PREFIX}_jeprof_dumps_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -786,6 +803,14 @@ echo "" >> "${MPSTAT_FILE}"
 echo "# Memory statistics for mysqld, allocator=${ALLOCATOR}, method=${MEM_REPORT} (every 2 minutes)" > "${MALLOC_INFO_FILE}"
 echo "# Started at: $(date)" >> "${MALLOC_INFO_FILE}"
 echo "" >> "${MALLOC_INFO_FILE}"
+
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    echo "# jemalloc heap profile dump log (every 5 minutes)" > "${JEPROF_LOG_FILE}"
+    echo "# Heap dumps written to: ${JEMALLOC_PROF_DIR}/jeprof.<pid>.<seq>.m<n>.heap" >> "${JEPROF_LOG_FILE}"
+    echo "# Analyze with: jeprof --text ${SERVER_BINARY} <dump>  (or --base=<earlier dump> for growth)" >> "${JEPROF_LOG_FILE}"
+    echo "# Started at: $(date)" >> "${JEPROF_LOG_FILE}"
+    echo "" >> "${JEPROF_LOG_FILE}"
+fi
 
 # Background data collection processes
 collect_proc_data() {
@@ -892,6 +917,7 @@ collect_rss_data() {
             [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
             [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
             [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
+            [ -n "${JEPROF_PID}" ] && kill ${JEPROF_PID} 2>/dev/null || true
 
             exit 1
         fi
@@ -1043,6 +1069,41 @@ collect_malloc_info() {
     done
 }
 
+# jemalloc heap profile dumps (every 5 minutes). mysqld runs with
+# MALLOC_CONF=prof:true,prof_active:true so jemalloc samples allocation call
+# stacks; mallctl("prof.dump") (invoked via gdb, same technique as
+# collect_malloc_info) writes a .heap file with every sampled stack and the
+# bytes it currently holds live. Diff two dumps with
+# jeprof --base=<old.heap> to see where memory grew between samples.
+collect_jemalloc_prof() {
+    local pid=$1
+    local hammerdb_pid=$2
+    local prof_dir=$3
+    local jeprof_log=$4
+
+    local iteration=0
+
+    while kill -0 ${pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        if [ $((iteration % 300)) -eq 0 ]; then
+            TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+            echo "=== ${TIMESTAMP} ===" >> "${jeprof_log}"
+
+            # prof.dump with a NULL filename uses prof_prefix and an
+            # auto-incrementing sequence number (jeprof.<pid>.<seq>.m<n>.heap)
+            sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
+                -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
+                >> "${jeprof_log}" 2>&1 || true
+
+            # Record the dump file this sample produced
+            ls -t "${prof_dir}"/*.heap 2>/dev/null | head -1 >> "${jeprof_log}" || true
+            echo "" >> "${jeprof_log}"
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 1
+    done
+}
+
 # mpstat per-CPU statistics monitoring function
 collect_mpstat() {
     local mpstat_file=$1
@@ -1068,6 +1129,7 @@ VMSTAT_PID=""
 IOSTAT_PID=""
 MPSTAT_PID=""
 MALLOC_INFO_PID=""
+JEPROF_PID=""
 
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
@@ -1097,6 +1159,12 @@ MPSTAT_PID=$!
 collect_malloc_info ${MYSQLD_PID} ${HAMMERDB_PID} "${MALLOC_INFO_FILE}" "${ALLOCATOR}" "${MEM_REPORT}" &
 MALLOC_INFO_PID=$!
 
+# Start jemalloc heap profile dumps in background (every 5 minutes)
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    collect_jemalloc_prof ${MYSQLD_PID} ${HAMMERDB_PID} "${JEMALLOC_PROF_DIR}" "${JEPROF_LOG_FILE}" &
+    JEPROF_PID=$!
+fi
+
 # Time reporting loop
 LAST_REPORT=0
 while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
@@ -1120,6 +1188,7 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
         [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
         [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
+        [ -n "${JEPROF_PID}" ] && kill ${JEPROF_PID} 2>/dev/null || true
         exit 1
     fi
 
@@ -1185,6 +1254,19 @@ HAMMERDB_EXIT=$?
 [ -n "${MALLOC_INFO_PID}" ] && kill ${MALLOC_INFO_PID} 2>/dev/null || true
 [ -n "${MALLOC_INFO_PID}" ] && wait ${MALLOC_INFO_PID} 2>/dev/null || true
 
+[ -n "${JEPROF_PID}" ] && kill ${JEPROF_PID} 2>/dev/null || true
+[ -n "${JEPROF_PID}" ] && wait ${JEPROF_PID} 2>/dev/null || true
+
+# Final jemalloc heap profile dump capturing end-of-benchmark state
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]] && kill -0 ${MYSQLD_PID} 2>/dev/null; then
+    log_info "Taking final jemalloc heap profile dump..."
+    echo "=== $(date +"%Y-%m-%d %H:%M:%S") (final) ===" >> "${JEPROF_LOG_FILE}"
+    sudo timeout -k 5 30 gdb --readnever -p ${MYSQLD_PID} -batch \
+        -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
+        >> "${JEPROF_LOG_FILE}" 2>&1 || true
+    echo "" >> "${JEPROF_LOG_FILE}"
+fi
+
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
 # Stop MySQL server
@@ -1236,6 +1318,12 @@ log_info "  - vmstat system statistics: ${VMSTAT_FILE}"
 log_info "  - iostat disk statistics: ${IOSTAT_FILE}"
 log_info "  - mpstat per-CPU statistics: ${MPSTAT_FILE}"
 log_info "  - Memory statistics (${MEM_REPORT}): ${MALLOC_INFO_FILE}"
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    log_info "  - jemalloc heap profiles (every 5 min): ${JEMALLOC_PROF_DIR}/"
+    log_info "  - jemalloc dump log: ${JEPROF_LOG_FILE}"
+    log_info "    Analyze: jeprof --text ${SERVER_BINARY} <dump.heap>"
+    log_info "    Growth between samples: jeprof --text --base=<older.heap> ${SERVER_BINARY} <newer.heap>"
+fi
 if [ -f "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log" ]; then
     log_info "  - HammerDB transaction profile: ${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_hdbxtprofile.log"
 fi
