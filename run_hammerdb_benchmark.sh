@@ -290,6 +290,10 @@ socket = ${MYSQL_SOCKET}
 # Disable SSL requirement
 require_secure_transport = OFF
 
+# Disable secure-file-priv restriction (tarball builds default to NULL,
+# which blocks all file import/export operations)
+secure-file-priv = ""
+
 # Other settings
 sql_mode = ""
 wait_timeout = ${MYSQL_TIMEOUT_SECONDS}        # 2x benchmark duration
