@@ -450,8 +450,16 @@ fi
 # negligible overhead). Dumps are triggered every 5 minutes by
 # collect_jemalloc_prof below. MALLOC_CONF is set only on the mysqld command
 # so hammerdbcli/mysql client (which inherit LD_PRELOAD) don't also dump.
+#
+# IMPORTANT: Percona Server has its own jemalloc profiling switch
+# (jemalloc_profiling, default OFF) and deactivates prof.active at startup,
+# overriding prof_active:true from MALLOC_CONF. Without SET GLOBAL
+# jemalloc_profiling=ON the dumps only ever contain the few startup
+# allocations sampled before the override (all dumps identical, diffs empty).
+# It is enabled via SQL after server startup below, and dumps are taken with
+# FLUSH MEMORY PROFILE (writes to prof_prefix like mallctl("prof.dump")).
 # Note: requires a jemalloc built with --enable-prof; if not (e.g. some
-# bundled jemalloc 3.6 builds), prof.dump fails and is logged, nothing else
+# bundled jemalloc 3.6 builds), enabling fails and is logged, nothing else
 # breaks.
 JEMALLOC_PROF_DIR="${RESULTS_DIR}/jeprof"
 MYSQLD_MALLOC_CONF=""
@@ -611,6 +619,31 @@ if ! check_allocator ${MYSQLD_PID} "${ALLOCATOR}"; then
     log_error "Allocator check failed, stopping server"
     kill ${MYSQLD_PID} 2>/dev/null || true
     exit 1
+fi
+
+# Activate jemalloc profiling. JEPROF_MODE selects how dumps are taken:
+#   sql - Percona Server: SET GLOBAL jemalloc_profiling=ON (re-enables
+#         prof.active that Percona switched off at startup), dumps via
+#         FLUSH MEMORY PROFILE
+#   gdb - non-Percona builds without the jemalloc_profiling variable:
+#         prof.active stays on from MALLOC_CONF, dumps via
+#         mallctl("prof.dump") gdb inferior call
+JEPROF_MODE=""
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    if "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+        -e "SET GLOBAL jemalloc_profiling=ON;" 2>/dev/null; then
+        JEPROF_MODE="sql"
+        JEPROF_STATE=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -N \
+            -e "SHOW GLOBAL VARIABLES LIKE 'jemalloc_profiling';" 2>/dev/null || true)
+        log_info "jemalloc profiling activated via SQL: ${JEPROF_STATE}"
+        if ! echo "${JEPROF_STATE}" | grep -q "ON"; then
+            log_error "jemalloc_profiling did not switch ON (jemalloc lacks --enable-prof?)"
+            log_error "Heap profile dumps will be empty"
+        fi
+    else
+        JEPROF_MODE="gdb"
+        log_info "jemalloc_profiling variable not available (not Percona Server?), using gdb prof.dump"
+    fi
 fi
 
 # 7. Build the database using hammerdb_load.tcl
@@ -1070,16 +1103,17 @@ collect_malloc_info() {
 }
 
 # jemalloc heap profile dumps (every 5 minutes). mysqld runs with
-# MALLOC_CONF=prof:true,prof_active:true so jemalloc samples allocation call
-# stacks; mallctl("prof.dump") (invoked via gdb, same technique as
-# collect_malloc_info) writes a .heap file with every sampled stack and the
-# bytes it currently holds live. Diff two dumps with
-# jeprof --base=<old.heap> to see where memory grew between samples.
+# MALLOC_CONF=prof:true so jemalloc samples allocation call stacks; each dump
+# is a .heap file with every sampled stack and the bytes it currently holds
+# live. Diff two dumps with jeprof --base=<old.heap> to see where memory grew
+# between samples. Dump method per JEPROF_MODE: FLUSH MEMORY PROFILE (sql,
+# Percona Server) or mallctl("prof.dump") gdb inferior call (gdb).
 collect_jemalloc_prof() {
     local pid=$1
     local hammerdb_pid=$2
     local prof_dir=$3
     local jeprof_log=$4
+    local jeprof_mode=$5
 
     local iteration=0
 
@@ -1088,11 +1122,16 @@ collect_jemalloc_prof() {
             TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
             echo "=== ${TIMESTAMP} ===" >> "${jeprof_log}"
 
-            # prof.dump with a NULL filename uses prof_prefix and an
-            # auto-incrementing sequence number (jeprof.<pid>.<seq>.m<n>.heap)
-            sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
-                -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
-                >> "${jeprof_log}" 2>&1 || true
+            # Both methods write to prof_prefix with an auto-incrementing
+            # sequence number (jeprof.<pid>.<seq>.m<n>.heap)
+            if [ "${jeprof_mode}" = "sql" ]; then
+                "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+                    -e "FLUSH MEMORY PROFILE;" >> "${jeprof_log}" 2>&1 || true
+            else
+                sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
+                    -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
+                    >> "${jeprof_log}" 2>&1 || true
+            fi
 
             # Record the dump file this sample produced
             ls -t "${prof_dir}"/*.heap 2>/dev/null | head -1 >> "${jeprof_log}" || true
@@ -1161,7 +1200,7 @@ MALLOC_INFO_PID=$!
 
 # Start jemalloc heap profile dumps in background (every 5 minutes)
 if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
-    collect_jemalloc_prof ${MYSQLD_PID} ${HAMMERDB_PID} "${JEMALLOC_PROF_DIR}" "${JEPROF_LOG_FILE}" &
+    collect_jemalloc_prof ${MYSQLD_PID} ${HAMMERDB_PID} "${JEMALLOC_PROF_DIR}" "${JEPROF_LOG_FILE}" "${JEPROF_MODE}" &
     JEPROF_PID=$!
 fi
 
@@ -1261,9 +1300,14 @@ HAMMERDB_EXIT=$?
 if [[ "${ALLOCATOR}" =~ ^jemalloc ]] && kill -0 ${MYSQLD_PID} 2>/dev/null; then
     log_info "Taking final jemalloc heap profile dump..."
     echo "=== $(date +"%Y-%m-%d %H:%M:%S") (final) ===" >> "${JEPROF_LOG_FILE}"
-    sudo timeout -k 5 30 gdb --readnever -p ${MYSQLD_PID} -batch \
-        -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
-        >> "${JEPROF_LOG_FILE}" 2>&1 || true
+    if [ "${JEPROF_MODE}" = "sql" ]; then
+        "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+            -e "FLUSH MEMORY PROFILE;" >> "${JEPROF_LOG_FILE}" 2>&1 || true
+    else
+        sudo timeout -k 5 30 gdb --readnever -p ${MYSQLD_PID} -batch \
+            -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
+            >> "${JEPROF_LOG_FILE}" 2>&1 || true
+    fi
     echo "" >> "${JEPROF_LOG_FILE}"
 fi
 
