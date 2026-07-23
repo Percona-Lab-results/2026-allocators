@@ -465,6 +465,9 @@ JEMALLOC_PROF_DIR="${RESULTS_DIR}/jeprof"
 MYSQLD_MALLOC_CONF=""
 if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
     mkdir -p "${JEMALLOC_PROF_DIR}"
+    # Remove stale FLUSH MEMORY PROFILE dumps from previous runs so they
+    # don't get copied into this run's results
+    rm -f /tmp/jeprof_mysqld* 2>/dev/null || true
     MYSQLD_MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:19,prof_prefix:${JEMALLOC_PROF_DIR}/jeprof"
     log_info "jemalloc heap profiling enabled: MALLOC_CONF=${MYSQLD_MALLOC_CONF}"
 fi
@@ -630,8 +633,12 @@ fi
 #         mallctl("prof.dump") gdb inferior call
 JEPROF_MODE=""
 if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
-    if "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
-        -e "SET GLOBAL jemalloc_profiling=ON;" 2>/dev/null; then
+    set +e
+    JEPROF_SET_OUTPUT=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+        -e "SET GLOBAL jemalloc_profiling=ON;" 2>&1)
+    JEPROF_SET_EXIT=$?
+    set -e
+    if [ ${JEPROF_SET_EXIT} -eq 0 ]; then
         JEPROF_MODE="sql"
         JEPROF_STATE=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -N \
             -e "SHOW GLOBAL VARIABLES LIKE 'jemalloc_profiling';" 2>/dev/null || true)
@@ -642,7 +649,8 @@ if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
         fi
     else
         JEPROF_MODE="gdb"
-        log_info "jemalloc_profiling variable not available (not Percona Server?), using gdb prof.dump"
+        log_warn "SET GLOBAL jemalloc_profiling=ON failed: ${JEPROF_SET_OUTPUT}"
+        log_warn "Falling back to gdb prof.dump (dumps may contain only startup allocations!)"
     fi
 fi
 
@@ -1122,19 +1130,22 @@ collect_jemalloc_prof() {
             TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
             echo "=== ${TIMESTAMP} ===" >> "${jeprof_log}"
 
-            # Both methods write to prof_prefix with an auto-incrementing
-            # sequence number (jeprof.<pid>.<seq>.m<n>.heap)
             if [ "${jeprof_mode}" = "sql" ]; then
+                # FLUSH MEMORY PROFILE writes /tmp/jeprof_mysqld.<pid>.<n>.<timestamp>
+                # (it ignores prof_prefix), so move the dump into the results dir
                 "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
                     -e "FLUSH MEMORY PROFILE;" >> "${jeprof_log}" 2>&1 || true
+                mv /tmp/jeprof_mysqld* "${prof_dir}/" 2>/dev/null || true
             else
+                # gdb mallctl("prof.dump") writes to prof_prefix
+                # (jeprof.<pid>.<seq>.m<n>.heap) which already points at prof_dir
                 sudo timeout -k 5 30 gdb --readnever -p ${pid} -batch \
                     -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
                     >> "${jeprof_log}" 2>&1 || true
             fi
 
             # Record the dump file this sample produced
-            ls -t "${prof_dir}"/*.heap 2>/dev/null | head -1 >> "${jeprof_log}" || true
+            ls -t "${prof_dir}" 2>/dev/null | head -1 >> "${jeprof_log}" || true
             echo "" >> "${jeprof_log}"
         fi
 
@@ -1303,6 +1314,7 @@ if [[ "${ALLOCATOR}" =~ ^jemalloc ]] && kill -0 ${MYSQLD_PID} 2>/dev/null; then
     if [ "${JEPROF_MODE}" = "sql" ]; then
         "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
             -e "FLUSH MEMORY PROFILE;" >> "${JEPROF_LOG_FILE}" 2>&1 || true
+        mv /tmp/jeprof_mysqld* "${JEMALLOC_PROF_DIR}/" 2>/dev/null || true
     else
         sudo timeout -k 5 30 gdb --readnever -p ${MYSQLD_PID} -batch \
             -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
