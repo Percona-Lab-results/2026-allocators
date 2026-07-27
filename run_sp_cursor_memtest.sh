@@ -9,7 +9,7 @@ set -euo pipefail
 # Usage:
 #   ./run_sp_cursor_memtest.sh [--server=/path/to/mysqld] [--datadir=PATH]
 #       [--buffer-gb=N] [--threads=N] [--duration=N] [--inner-iters=N]
-#       [--allocator=glibc|jemalloc36|jemalloc53|tcmalloc]
+#       [--delay-ms=N] [--allocator=glibc|jemalloc36|jemalloc53|tcmalloc]
 #
 # Defaults:
 #   --server      ${HOME}/servers/Percona-Server-8.4.8-8-Linux.x86_64.glibc2.35/bin/mysqld
@@ -18,6 +18,7 @@ set -euo pipefail
 #   --threads     16
 #   --duration    900 (seconds)
 #   --inner-iters 100 (cursor opens per CALL)
+#   --delay-ms    0 (per-thread sleep after each CALL; 0 = no delay)
 #   --allocator   jemalloc53
 #
 # With a jemalloc allocator, heap profiling is enabled (same mechanism as
@@ -36,6 +37,7 @@ BUFFER_POOL_SIZE_GB=80
 TEST_THREADS=64
 TEST_DURATION=900
 TEST_INNER_ITERS=100
+TEST_DELAY_MS=0
 ALLOCATOR="jemalloc53"
 
 MYSQL_SOCKET="/tmp/mysql-cursor-test.sock"
@@ -58,6 +60,7 @@ for arg in "$@"; do
         --threads=*)     TEST_THREADS="${arg#*=}" ;;
         --duration=*)    TEST_DURATION="${arg#*=}" ;;
         --inner-iters=*) TEST_INNER_ITERS="${arg#*=}" ;;
+        --delay-ms=*)    TEST_DELAY_MS="${arg#*=}" ;;
         --allocator=*)   ALLOCATOR="${arg#*=}" ;;
         *) log_error "Unknown argument: $arg"; exit 1 ;;
     esac
@@ -451,11 +454,11 @@ rss_logger() {
 
 # 8. Run the cursor memory test (in background so the RSS logger can
 # terminate it if the memory limit is exceeded)
-log_info "Running sp_cursor_memtest (threads=${TEST_THREADS}, duration=${TEST_DURATION}s, inner-iters=${TEST_INNER_ITERS})..."
+log_info "Running sp_cursor_memtest (threads=${TEST_THREADS}, duration=${TEST_DURATION}s, inner-iters=${TEST_INNER_ITERS}, delay-ms=${TEST_DELAY_MS})..."
 log_info "RSS limit: $((RSS_LIMIT_KB / 1024 / 1024)) GB"
 "${MEMTEST_BIN}" --socket="${MYSQL_SOCKET}" --user=tpcuser --password=tpcpass \
     --threads="${TEST_THREADS}" --duration="${TEST_DURATION}" \
-    --inner-iters="${TEST_INNER_ITERS}" --report=30 &
+    --inner-iters="${TEST_INNER_ITERS}" --delay-ms="${TEST_DELAY_MS}" --report=30 &
 MEMTEST_PID=$!
 
 rss_logger ${MYSQLD_PID} ${MEMTEST_PID} &

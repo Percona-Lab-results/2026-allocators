@@ -40,6 +40,9 @@
 //   --report=N          monitor report interval in seconds (10)
 //   --inner-iters=N     cursor opens per CALL, done in an SQL loop (100)
 //   --rows-per-name=N   customer rows per last name (100)
+//   --delay-ms=N        per-thread sleep in milliseconds after each CALL,
+//                       i.e. after every inner-iters cursor opens
+//                       (0 = no delay, default)
 //   --skip-setup        reuse existing sp_cursor_test schema
 
 #include <mysql.h>
@@ -68,6 +71,7 @@ struct Config {
   int report_sec = 10;
   int inner_iters = 100;
   int rows_per_name = 100;
+  int delay_ms = 0;
   bool skip_setup = false;
 };
 
@@ -237,6 +241,8 @@ void worker(const Config &cfg, int id) {
     if (exec(conn, sql)) {
       g_calls.fetch_add(1, std::memory_order_relaxed);
       g_cursor_opens.fetch_add(cfg.inner_iters, std::memory_order_relaxed);
+      if (cfg.delay_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(cfg.delay_ms));
     } else {
       g_errors.fetch_add(1, std::memory_order_relaxed);
       std::fprintf(stderr, "worker %d: %s\n", id, mysql_error(conn));
@@ -315,6 +321,7 @@ int main(int argc, char **argv) {
     else if (const char *v = val("--report=")) cfg.report_sec = std::atoi(v);
     else if (const char *v = val("--inner-iters=")) cfg.inner_iters = std::atoi(v);
     else if (const char *v = val("--rows-per-name=")) cfg.rows_per_name = std::atoi(v);
+    else if (const char *v = val("--delay-ms=")) cfg.delay_ms = std::atoi(v);
     else if (a == "--skip-setup") cfg.skip_setup = true;
     else die("unknown argument: " + a + " (see header comment for usage)");
   }
@@ -324,8 +331,8 @@ int main(int argc, char **argv) {
   if (!cfg.skip_setup) setup_schema(cfg);
 
   std::printf("Starting %d worker threads, %d cursor opens per CALL, "
-              "%d seconds...\n\n",
-              cfg.threads, cfg.inner_iters, cfg.duration_sec);
+              "%d ms delay after each CALL, %d seconds...\n\n",
+              cfg.threads, cfg.inner_iters, cfg.delay_ms, cfg.duration_sec);
 
   MYSQL *mon = connect(cfg, kDb);
   auto start = std::chrono::steady_clock::now();
