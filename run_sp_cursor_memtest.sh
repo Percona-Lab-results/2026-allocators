@@ -9,6 +9,7 @@ set -euo pipefail
 # Usage:
 #   ./run_sp_cursor_memtest.sh [--server=/path/to/mysqld] [--datadir=PATH]
 #       [--buffer-gb=N] [--threads=N] [--duration=N] [--inner-iters=N]
+#       [--allocator=glibc|jemalloc36|jemalloc53|tcmalloc]
 #
 # Defaults:
 #   --server      ${HOME}/servers/Percona-Server-8.4.8-8-Linux.x86_64.glibc2.35/bin/mysqld
@@ -17,6 +18,15 @@ set -euo pipefail
 #   --threads     16
 #   --duration    900 (seconds)
 #   --inner-iters 100 (cursor opens per CALL)
+#   --allocator   jemalloc53
+#
+# With a jemalloc allocator, heap profiling is enabled (same mechanism as
+# run_hammerdb_benchmark.sh): mysqld starts with MALLOC_CONF=prof:true,
+# jemalloc_profiling is switched ON via SQL, and a heap dump is taken every
+# 5 minutes plus a final one before shutdown. Dumps land in
+# <results>/jeprof/; analyze with:
+#   jeprof --text <mysqld> <dump.heap>
+#   jeprof --text --base=<older.heap> <mysqld> <newer.heap>
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -26,6 +36,7 @@ BUFFER_POOL_SIZE_GB=80
 TEST_THREADS=64
 TEST_DURATION=900
 TEST_INNER_ITERS=100
+ALLOCATOR="jemalloc53"
 
 MYSQL_SOCKET="/tmp/mysql-cursor-test.sock"
 MY_CNF="${SCRIPT_DIR}/my-cursor-test.cnf"
@@ -47,9 +58,15 @@ for arg in "$@"; do
         --threads=*)     TEST_THREADS="${arg#*=}" ;;
         --duration=*)    TEST_DURATION="${arg#*=}" ;;
         --inner-iters=*) TEST_INNER_ITERS="${arg#*=}" ;;
+        --allocator=*)   ALLOCATOR="${arg#*=}" ;;
         *) log_error "Unknown argument: $arg"; exit 1 ;;
     esac
 done
+
+if [[ ! "${ALLOCATOR}" =~ ^(glibc|jemalloc36|jemalloc53|tcmalloc)$ ]]; then
+    log_error "Allocator must be one of: glibc, jemalloc36, jemalloc53, tcmalloc"
+    exit 1
+fi
 
 if [ ! -f "${SERVER_BINARY}" ]; then
     log_error "Server binary not found: ${SERVER_BINARY}"
@@ -78,6 +95,8 @@ SMAPS_ROLLUP_FILE="${RESULTS_DIR}/mysql_smaps_rollup_${DATE_TIME}.log"
 SMAPS_FILE="${RESULTS_DIR}/mysql_smaps_${DATE_TIME}.log"
 STAT_FILE="${RESULTS_DIR}/mysql_stat_${DATE_TIME}.log"
 MAPS_FILE="${RESULTS_DIR}/mysql_maps_${DATE_TIME}.log"
+JEPROF_LOG_FILE="${RESULTS_DIR}/jeprof_dumps_${DATE_TIME}.log"
+JEMALLOC_PROF_DIR="${RESULTS_DIR}/jeprof"
 
 # 1. Clear and initialize the data directory
 if [ -d "${SERVER_DATA_DIR}" ]; then
@@ -143,9 +162,59 @@ wait_timeout = 288000        # 80 hours
 interactive_timeout = 288000 # 80 hours
 EOF
 
-# 3. Start the server
+# 3. Allocator setup (LD_PRELOAD) and jemalloc heap profiling
+# (same mechanism as run_hammerdb_benchmark.sh)
+if [ "${ALLOCATOR}" = "jemalloc36" ]; then
+    SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
+    JEMALLOC_LIB="${SERVER_DIR}/lib/mysql/libjemalloc.so.1"
+    if [ ! -f "${JEMALLOC_LIB}" ]; then
+        log_error "jemalloc36 library not found at: ${JEMALLOC_LIB}"
+        exit 1
+    fi
+    export LD_PRELOAD="${JEMALLOC_LIB}"
+    log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
+elif [ "${ALLOCATOR}" = "jemalloc53" ]; then
+    JEMALLOC_LIB="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+    if [ ! -f "${JEMALLOC_LIB}" ]; then
+        log_error "jemalloc53 library not found at: ${JEMALLOC_LIB}"
+        log_error "Install with: sudo apt-get install libjemalloc2"
+        exit 1
+    fi
+    export LD_PRELOAD="${JEMALLOC_LIB}"
+    log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
+elif [ "${ALLOCATOR}" = "tcmalloc" ]; then
+    TCMALLOC_LIB="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
+    if [ ! -f "${TCMALLOC_LIB}" ]; then
+        log_error "tcmalloc library not found at: ${TCMALLOC_LIB}"
+        log_error "Install with: sudo apt-get install libgoogle-perftools-dev"
+        exit 1
+    fi
+    export LD_PRELOAD="${TCMALLOC_LIB}"
+    log_info "LD_PRELOAD set to: ${LD_PRELOAD}"
+fi
+
+# jemalloc heap profiling: sampled allocation profiling in mysqld.
+# lg_prof_sample:19 = one sample per ~512KiB allocated (jemalloc default,
+# negligible overhead). MALLOC_CONF is set only on the mysqld command so
+# sp_cursor_memtest / mysql client (which inherit LD_PRELOAD) don't dump.
+# Percona Server deactivates prof.active at startup, so jemalloc_profiling
+# is switched ON via SQL after the server is up (see below).
+MYSQLD_MALLOC_CONF=""
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    mkdir -p "${JEMALLOC_PROF_DIR}"
+    # Remove stale FLUSH MEMORY PROFILE dumps from previous runs
+    rm -f /tmp/jeprof_mysqld* 2>/dev/null || true
+    MYSQLD_MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:19,prof_prefix:${JEMALLOC_PROF_DIR}/jeprof"
+    log_info "jemalloc heap profiling enabled: MALLOC_CONF=${MYSQLD_MALLOC_CONF}"
+fi
+
+# 4. Start the server
 log_info "Starting MySQL server..."
-"${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
+if [ -n "${MYSQLD_MALLOC_CONF}" ]; then
+    env "MALLOC_CONF=${MYSQLD_MALLOC_CONF}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
+else
+    "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
+fi
 MYSQLD_PID=$!
 
 stop_server() {
@@ -159,10 +228,12 @@ stop_server() {
 RSS_LOGGER_PID=""
 MEMTEST_PID=""
 COLLECTOR_PID=""
+JEPROF_PID=""
 cleanup() {
     [ -n "${MEMTEST_PID}" ] && kill ${MEMTEST_PID} 2>/dev/null || true
     [ -n "${RSS_LOGGER_PID}" ] && kill ${RSS_LOGGER_PID} 2>/dev/null || true
     [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+    [ -n "${JEPROF_PID}" ] && kill ${JEPROF_PID} 2>/dev/null || true
     stop_server
 }
 trap cleanup INT TERM EXIT
@@ -184,7 +255,7 @@ for i in {1..120}; do
     sleep 2
 done
 
-# 4. Create tpcuser
+# 5. Create tpcuser
 log_info "Creating user tpcuser..."
 "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root <<EOF
 CREATE USER IF NOT EXISTS 'tpcuser'@'%' IDENTIFIED BY 'tpcpass';
@@ -194,7 +265,78 @@ GRANT ALL PRIVILEGES ON *.* TO 'tpcuser'@'localhost' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 EOF
 
-# 5. /proc/<pid> data collection (same as run_hammerdb_benchmark.sh:
+# Activate jemalloc profiling. JEPROF_MODE selects how dumps are taken:
+#   sql - Percona Server: SET GLOBAL jemalloc_profiling=ON (re-enables
+#         prof.active that Percona switched off at startup), dumps via
+#         FLUSH MEMORY PROFILE
+#   gdb - non-Percona builds without the jemalloc_profiling variable:
+#         prof.active stays on from MALLOC_CONF, dumps via
+#         mallctl("prof.dump") gdb inferior call
+JEPROF_MODE=""
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    set +e
+    JEPROF_SET_OUTPUT=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+        -e "SET GLOBAL jemalloc_profiling=ON;" 2>&1)
+    JEPROF_SET_EXIT=$?
+    set -e
+    if [ ${JEPROF_SET_EXIT} -eq 0 ]; then
+        JEPROF_MODE="sql"
+        JEPROF_STATE=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -N \
+            -e "SHOW GLOBAL VARIABLES LIKE 'jemalloc_profiling';" 2>/dev/null || true)
+        log_info "jemalloc profiling activated via SQL: ${JEPROF_STATE}"
+        if ! echo "${JEPROF_STATE}" | grep -q "ON"; then
+            log_error "jemalloc_profiling did not switch ON (jemalloc lacks --enable-prof?)"
+            log_error "Heap profile dumps will be empty"
+        fi
+    else
+        JEPROF_MODE="gdb"
+        log_error "SET GLOBAL jemalloc_profiling=ON failed: ${JEPROF_SET_OUTPUT}"
+        log_error "Falling back to gdb prof.dump (dumps may contain only startup allocations!)"
+    fi
+
+    echo "# jemalloc heap profile dump log (every 5 minutes), mode=${JEPROF_MODE}" > "${JEPROF_LOG_FILE}"
+    echo "# Heap dumps written to: ${JEMALLOC_PROF_DIR}/" >> "${JEPROF_LOG_FILE}"
+    echo "# Analyze with: jeprof --text ${SERVER_BINARY} <dump>  (or --base=<earlier dump> for growth)" >> "${JEPROF_LOG_FILE}"
+    echo "# Started at: $(date)" >> "${JEPROF_LOG_FILE}"
+    echo "" >> "${JEPROF_LOG_FILE}"
+fi
+
+# Take a jemalloc heap profile dump (both methods write into JEMALLOC_PROF_DIR)
+jemalloc_prof_dump() {
+    if [ "${JEPROF_MODE}" = "sql" ]; then
+        # FLUSH MEMORY PROFILE writes /tmp/jeprof_mysqld.<pid>.<n>.<timestamp>
+        # (it ignores prof_prefix), so move the dump into the results dir
+        "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root \
+            -e "FLUSH MEMORY PROFILE;" >> "${JEPROF_LOG_FILE}" 2>&1 || true
+        mv /tmp/jeprof_mysqld* "${JEMALLOC_PROF_DIR}/" 2>/dev/null || true
+    else
+        # gdb mallctl("prof.dump") writes to prof_prefix
+        # (jeprof.<pid>.<seq>.m<n>.heap) which already points at prof_dir
+        sudo timeout -k 5 30 gdb --readnever -p ${MYSQLD_PID} -batch \
+            -ex 'call (int) mallctl("prof.dump", (void *)0, (void *)0, (void *)0, (unsigned long)0)' \
+            >> "${JEPROF_LOG_FILE}" 2>&1 || true
+    fi
+}
+
+# jemalloc heap profile dumps every 5 minutes
+collect_jemalloc_prof() {
+    local pid=$1
+    local iteration=0
+
+    while kill -0 ${pid} 2>/dev/null; do
+        if [ $((iteration % 300)) -eq 0 ]; then
+            echo "=== $(date +"%Y-%m-%d %H:%M:%S") ===" >> "${JEPROF_LOG_FILE}"
+            jemalloc_prof_dump
+            # Record the dump file this sample produced
+            ls -t "${JEMALLOC_PROF_DIR}" 2>/dev/null | head -1 >> "${JEPROF_LOG_FILE}" || true
+            echo "" >> "${JEPROF_LOG_FILE}"
+        fi
+        iteration=$((iteration + 1))
+        sleep 1
+    done
+}
+
+# 6. /proc/<pid> data collection (same as run_hammerdb_benchmark.sh:
 # status, smaps_rollup, stat, maps every 1 second; smaps every 30 seconds)
 log_info "Collecting /proc/${MYSQLD_PID}/ data into: ${RESULTS_DIR}"
 
@@ -270,7 +412,14 @@ collect_proc_data() {
 collect_proc_data ${MYSQLD_PID} &
 COLLECTOR_PID=$!
 
-# 6. RSS/VSZ logger: sample mysqld memory every 30 seconds
+# Start jemalloc heap profile dumps in background (every 5 minutes)
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    log_info "jemalloc heap profile dumps every 5 minutes (mode=${JEPROF_MODE}) to: ${JEMALLOC_PROF_DIR}"
+    collect_jemalloc_prof ${MYSQLD_PID} &
+    JEPROF_PID=$!
+fi
+
+# 7. RSS/VSZ logger: sample mysqld memory every 30 seconds
 # (separate from collect_proc_data because it also enforces the RSS limit)
 log_info "Logging mysqld RSS/VSZ every 30 seconds to: ${RSS_LOG}"
 echo "# mysqld memory log (every 30 seconds), PID ${MYSQLD_PID}" > "${RSS_LOG}"
@@ -300,7 +449,7 @@ rss_logger() {
     done
 }
 
-# 7. Run the cursor memory test (in background so the RSS logger can
+# 8. Run the cursor memory test (in background so the RSS logger can
 # terminate it if the memory limit is exceeded)
 log_info "Running sp_cursor_memtest (threads=${TEST_THREADS}, duration=${TEST_DURATION}s, inner-iters=${TEST_INNER_ITERS})..."
 log_info "RSS limit: $((RSS_LIMIT_KB / 1024 / 1024)) GB"
@@ -321,7 +470,7 @@ if [ ${MEMTEST_EXIT} -ne 0 ]; then
     log_error "sp_cursor_memtest exited with code ${MEMTEST_EXIT}"
 fi
 
-# 8. Stop the collectors, then compute memory growth between the first
+# 9. Stop the collectors, then compute memory growth between the first
 # sample and the last sample taken while the test was still running
 # (the server is still up here, but no further samples are appended)
 [ -n "${RSS_LOGGER_PID}" ] && kill ${RSS_LOGGER_PID} 2>/dev/null || true
@@ -331,6 +480,19 @@ RSS_LOGGER_PID=""
 [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
 wait ${COLLECTOR_PID} 2>/dev/null || true
 COLLECTOR_PID=""
+
+[ -n "${JEPROF_PID}" ] && kill ${JEPROF_PID} 2>/dev/null || true
+wait ${JEPROF_PID} 2>/dev/null || true
+JEPROF_PID=""
+
+# Final jemalloc heap profile dump capturing end-of-test state (the test's
+# connections have disconnected by now, so this shows what the server keeps)
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]] && kill -0 ${MYSQLD_PID} 2>/dev/null; then
+    log_info "Taking final jemalloc heap profile dump..."
+    echo "=== $(date +"%Y-%m-%d %H:%M:%S") (final) ===" >> "${JEPROF_LOG_FILE}"
+    jemalloc_prof_dump
+    echo "" >> "${JEPROF_LOG_FILE}"
+fi
 
 FIRST_SAMPLE=$(grep -v '^#' "${RSS_LOG}" | head -1)
 LAST_SAMPLE=$(grep -v '^#' "${RSS_LOG}" | tail -1)
@@ -371,7 +533,7 @@ else
     log_error "Not enough samples in ${RSS_LOG} to compute memory growth (need at least 2)"
 fi
 
-# 9. Shut down (trap also covers abnormal exits)
+# 10. Shut down (trap also covers abnormal exits)
 stop_server
 trap - INT TERM EXIT
 
@@ -382,4 +544,10 @@ log_info "  - MySQL smaps_rollup data: ${SMAPS_ROLLUP_FILE}"
 log_info "  - MySQL smaps data: ${SMAPS_FILE}"
 log_info "  - MySQL stat data: ${STAT_FILE}"
 log_info "  - MySQL maps data: ${MAPS_FILE}"
+if [[ "${ALLOCATOR}" =~ ^jemalloc ]]; then
+    log_info "  - jemalloc heap profiles (every 5 min): ${JEMALLOC_PROF_DIR}/"
+    log_info "  - jemalloc dump log: ${JEPROF_LOG_FILE}"
+    log_info "    Analyze: jeprof --text ${SERVER_BINARY} <dump.heap>"
+    log_info "    Growth between samples: jeprof --text --base=<older.heap> ${SERVER_BINARY} <newer.heap>"
+fi
 exit ${MEMTEST_EXIT}
