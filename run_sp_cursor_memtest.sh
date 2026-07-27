@@ -69,7 +69,15 @@ if [ ! -x "${MYSQL_CLIENT}" ]; then
 fi
 
 DATE_TIME=$(date +%Y%m%d_%H%M%S)
-RSS_LOG="${SCRIPT_DIR}/sp_cursor_memtest_rss_${DATE_TIME}.log"
+RESULTS_DIR="${SCRIPT_DIR}/results-sp-cursor-memtest-${DATE_TIME}"
+mkdir -p "${RESULTS_DIR}"
+
+RSS_LOG="${RESULTS_DIR}/sp_cursor_memtest_rss_${DATE_TIME}.log"
+STATUS_FILE="${RESULTS_DIR}/mysql_status_${DATE_TIME}.log"
+SMAPS_ROLLUP_FILE="${RESULTS_DIR}/mysql_smaps_rollup_${DATE_TIME}.log"
+SMAPS_FILE="${RESULTS_DIR}/mysql_smaps_${DATE_TIME}.log"
+STAT_FILE="${RESULTS_DIR}/mysql_stat_${DATE_TIME}.log"
+MAPS_FILE="${RESULTS_DIR}/mysql_maps_${DATE_TIME}.log"
 
 # 1. Clear and initialize the data directory
 if [ -d "${SERVER_DATA_DIR}" ]; then
@@ -150,9 +158,11 @@ stop_server() {
 
 RSS_LOGGER_PID=""
 MEMTEST_PID=""
+COLLECTOR_PID=""
 cleanup() {
     [ -n "${MEMTEST_PID}" ] && kill ${MEMTEST_PID} 2>/dev/null || true
     [ -n "${RSS_LOGGER_PID}" ] && kill ${RSS_LOGGER_PID} 2>/dev/null || true
+    [ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
     stop_server
 }
 trap cleanup INT TERM EXIT
@@ -184,7 +194,84 @@ GRANT ALL PRIVILEGES ON *.* TO 'tpcuser'@'localhost' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 EOF
 
-# 5. RSS/VSZ logger: sample mysqld memory every 30 seconds
+# 5. /proc/<pid> data collection (same as run_hammerdb_benchmark.sh:
+# status, smaps_rollup, stat, maps every 1 second; smaps every 30 seconds)
+log_info "Collecting /proc/${MYSQLD_PID}/ data into: ${RESULTS_DIR}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
+echo "# Started at: $(date)" >> "${STATUS_FILE}"
+echo "" >> "${STATUS_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/smaps_rollup data collection" > "${SMAPS_ROLLUP_FILE}"
+echo "# Started at: $(date)" >> "${SMAPS_ROLLUP_FILE}"
+echo "" >> "${SMAPS_ROLLUP_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/smaps data collection (every 30 seconds)" > "${SMAPS_FILE}"
+echo "# Started at: $(date)" >> "${SMAPS_FILE}"
+echo "" >> "${SMAPS_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/stat data collection" > "${STAT_FILE}"
+echo "# Started at: $(date)" >> "${STAT_FILE}"
+echo "" >> "${STAT_FILE}"
+
+echo "# MySQL /proc/${MYSQLD_PID}/maps data collection" > "${MAPS_FILE}"
+echo "# Started at: $(date)" >> "${MAPS_FILE}"
+echo "" >> "${MAPS_FILE}"
+
+collect_proc_data() {
+    local pid=$1
+    local iteration=0
+
+    while kill -0 ${pid} 2>/dev/null; do
+        TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+
+        # Collect status (every 1 second)
+        if [ -f "/proc/${pid}/status" ]; then
+            echo "=== ${TIMESTAMP} ===" >> "${STATUS_FILE}"
+            cat /proc/${pid}/status >> "${STATUS_FILE}" 2>/dev/null || true
+            echo "" >> "${STATUS_FILE}"
+        fi
+
+        # Collect smaps_rollup (every 1 second)
+        if [ -f "/proc/${pid}/smaps_rollup" ]; then
+            echo "=== ${TIMESTAMP} ===" >> "${SMAPS_ROLLUP_FILE}"
+            cat /proc/${pid}/smaps_rollup >> "${SMAPS_ROLLUP_FILE}" 2>/dev/null || true
+            echo "" >> "${SMAPS_ROLLUP_FILE}"
+        fi
+
+        # Collect stat (every 1 second)
+        if [ -f "/proc/${pid}/stat" ]; then
+            echo "=== ${TIMESTAMP} ===" >> "${STAT_FILE}"
+            cat /proc/${pid}/stat >> "${STAT_FILE}" 2>/dev/null || true
+            echo "" >> "${STAT_FILE}"
+        fi
+
+        # Collect maps (every 1 second)
+        if [ -f "/proc/${pid}/maps" ]; then
+            echo "=== ${TIMESTAMP} ===" >> "${MAPS_FILE}"
+            cat /proc/${pid}/maps >> "${MAPS_FILE}" 2>/dev/null || true
+            echo "" >> "${MAPS_FILE}"
+        fi
+
+        # Collect smaps (every 30 seconds)
+        if [ $((iteration % 30)) -eq 0 ]; then
+            if [ -f "/proc/${pid}/smaps" ]; then
+                echo "=== ${TIMESTAMP} ===" >> "${SMAPS_FILE}"
+                cat /proc/${pid}/smaps >> "${SMAPS_FILE}" 2>/dev/null || true
+                echo "" >> "${SMAPS_FILE}"
+            fi
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 1
+    done
+}
+
+collect_proc_data ${MYSQLD_PID} &
+COLLECTOR_PID=$!
+
+# 6. RSS/VSZ logger: sample mysqld memory every 30 seconds
+# (separate from collect_proc_data because it also enforces the RSS limit)
 log_info "Logging mysqld RSS/VSZ every 30 seconds to: ${RSS_LOG}"
 echo "# mysqld memory log (every 30 seconds), PID ${MYSQLD_PID}" > "${RSS_LOG}"
 echo "# Timestamp, VmRSS_KB, VmSize_KB" >> "${RSS_LOG}"
@@ -213,7 +300,7 @@ rss_logger() {
     done
 }
 
-# 6. Run the cursor memory test (in background so the RSS logger can
+# 7. Run the cursor memory test (in background so the RSS logger can
 # terminate it if the memory limit is exceeded)
 log_info "Running sp_cursor_memtest (threads=${TEST_THREADS}, duration=${TEST_DURATION}s, inner-iters=${TEST_INNER_ITERS})..."
 log_info "RSS limit: $((RSS_LIMIT_KB / 1024 / 1024)) GB"
@@ -234,12 +321,16 @@ if [ ${MEMTEST_EXIT} -ne 0 ]; then
     log_error "sp_cursor_memtest exited with code ${MEMTEST_EXIT}"
 fi
 
-# 7. Stop the RSS logger, then compute memory growth between the first
+# 8. Stop the collectors, then compute memory growth between the first
 # sample and the last sample taken while the test was still running
 # (the server is still up here, but no further samples are appended)
 [ -n "${RSS_LOGGER_PID}" ] && kill ${RSS_LOGGER_PID} 2>/dev/null || true
 wait ${RSS_LOGGER_PID} 2>/dev/null || true
 RSS_LOGGER_PID=""
+
+[ -n "${COLLECTOR_PID}" ] && kill ${COLLECTOR_PID} 2>/dev/null || true
+wait ${COLLECTOR_PID} 2>/dev/null || true
+COLLECTOR_PID=""
 
 FIRST_SAMPLE=$(grep -v '^#' "${RSS_LOG}" | head -1)
 LAST_SAMPLE=$(grep -v '^#' "${RSS_LOG}" | tail -1)
@@ -280,9 +371,15 @@ else
     log_error "Not enough samples in ${RSS_LOG} to compute memory growth (need at least 2)"
 fi
 
-# 8. Shut down (trap also covers abnormal exits)
+# 9. Shut down (trap also covers abnormal exits)
 stop_server
 trap - INT TERM EXIT
 
-log_info "Done. Memory log: ${RSS_LOG}"
+log_info "Results directory: ${RESULTS_DIR}"
+log_info "  - RSS/VSZ memory log: ${RSS_LOG}"
+log_info "  - MySQL status data: ${STATUS_FILE}"
+log_info "  - MySQL smaps_rollup data: ${SMAPS_ROLLUP_FILE}"
+log_info "  - MySQL smaps data: ${SMAPS_FILE}"
+log_info "  - MySQL stat data: ${STAT_FILE}"
+log_info "  - MySQL maps data: ${MAPS_FILE}"
 exit ${MEMTEST_EXIT}
