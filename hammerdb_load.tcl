@@ -20,6 +20,7 @@ diset tpcc mysql_pass tpcpass
 diset tpcc mysql_dbase tpcc
 diset tpcc mysql_storage_engine innodb
 diset tpcc mysql_history_pk true
+diset tpcc mysql_no_stored_procs true
 diset tpcc mysql_partition true
 
 diset tpcc mysql_count_ware 3000
