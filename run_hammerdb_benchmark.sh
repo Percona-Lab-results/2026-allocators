@@ -656,6 +656,7 @@ diset tpcc mysql_duration ${BENCHMARK_DURATION_MINUTES}
 diset tpcc mysql_allwarehouse true
 diset tpcc mysql_timeprofile true
 diset tpcc mysql_history_pk true
+diset tpcc mysql_no_stored_procs true
 diset tpcc mysql_total_iterations 100000000
 EOF
 
