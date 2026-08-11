@@ -126,7 +126,7 @@ def find_global_status_logs(data_dir):
 
 def find_rss_memory_logs(data_dir):
     """
-    Find all *_rss_memory_*.log files in subdirectories.
+    Find all *_mysql_status_*.log files in subdirectories.
     Returns a dict: {result_dir_name: log_file_path}
     """
     results = {}
@@ -142,8 +142,8 @@ def find_rss_memory_logs(data_dir):
         if not os.path.isdir(result_dir):
             continue
 
-        # Find RSS memory log files
-        pattern = os.path.join(result_dir, '*_rss_memory_*.log')
+        # Find mysql status log files
+        pattern = os.path.join(result_dir, '*_mysql_status_*.log')
         log_files = glob.glob(pattern)
 
         if log_files:
@@ -155,49 +155,70 @@ def find_rss_memory_logs(data_dir):
 
 def parse_rss_memory_log(log_file):
     """
-    Parse RSS memory log file and extract mysqld RSS data (every minute).
-    Returns a list of (timestamp, elapsed_seconds, rss_mb) tuples.
+    Parse a /proc/<pid>/status-style mysql_status log file and extract
+    mysqld VmRSS and VmSize (VSZ) data (every minute).
+    Returns a list of (timestamp, elapsed_seconds, rss_mb, vsz_mb) tuples.
     """
+    from datetime import datetime
+
     data_points = []
     start_time = None
+    current_timestamp = None
+    current_rss_mb = None
+    current_vsz_mb = None
 
     with open(log_file, 'r') as f:
         for line in f:
             line = line.strip()
 
-            # Skip comments
-            if line.startswith('#') or not line:
+            # Match timestamp lines like "=== 2026-06-17 14:38:30 ==="
+            timestamp_match = re.match(r'^===\s+([\d-]+\s+[\d:]+)\s+===$', line)
+            if timestamp_match:
+                if current_rss_mb is not None and current_vsz_mb is not None:
+                    try:
+                        timestamp = datetime.strptime(current_timestamp, '%Y-%m-%d %H:%M:%S')
+                        if start_time is None:
+                            start_time = timestamp
+                        elapsed = (timestamp - start_time).total_seconds()
+                        data_points.append((current_timestamp, elapsed, current_rss_mb, current_vsz_mb))
+                    except ValueError:
+                        pass
+
+                current_timestamp = timestamp_match.group(1)
+                current_rss_mb = None
+                current_vsz_mb = None
                 continue
 
-            # Parse data line: Timestamp, mysqld_PID, mysqld_RSS_KB, hammerdbcli_PID, hammerdbcli_RSS_KB
-            parts = [p.strip() for p in line.split(',')]
-            if len(parts) >= 3:
-                try:
-                    timestamp_str = parts[0]
-                    mysqld_rss_kb = int(parts[2])
+            # Match "VmRSS:\t159824104 kB"
+            if current_timestamp and line.startswith('VmRSS:'):
+                value_match = re.search(r'(\d+)\s*kB', line)
+                if value_match:
+                    current_rss_mb = int(value_match.group(1)) / 1024
+                continue
 
-                    # Parse timestamp
-                    from datetime import datetime
-                    timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+            # Match "VmSize:\t167222748 kB" (VSZ)
+            if current_timestamp and line.startswith('VmSize:'):
+                value_match = re.search(r'(\d+)\s*kB', line)
+                if value_match:
+                    current_vsz_mb = int(value_match.group(1)) / 1024
+                continue
 
-                    if start_time is None:
-                        start_time = timestamp
-
-                    # Calculate elapsed seconds
-                    elapsed = (timestamp - start_time).total_seconds()
-
-                    # Convert KB to MB
-                    rss_mb = mysqld_rss_kb / 1024
-
-                    data_points.append((timestamp_str, elapsed, rss_mb))
-                except (ValueError, IndexError):
-                    continue
+        # Save the last block
+        if current_rss_mb is not None and current_vsz_mb is not None:
+            try:
+                timestamp = datetime.strptime(current_timestamp, '%Y-%m-%d %H:%M:%S')
+                if start_time is None:
+                    start_time = timestamp
+                elapsed = (timestamp - start_time).total_seconds()
+                data_points.append((current_timestamp, elapsed, current_rss_mb, current_vsz_mb))
+            except ValueError:
+                pass
 
     # Sample every minute (every 60 seconds)
     sampled_data = []
-    for i, (timestamp_str, elapsed, rss_mb) in enumerate(data_points):
+    for i, (timestamp_str, elapsed, rss_mb, vsz_mb) in enumerate(data_points):
         if i == 0 or int(elapsed) % 60 == 0:
-            sampled_data.append((timestamp_str, elapsed, rss_mb))
+            sampled_data.append((timestamp_str, elapsed, rss_mb, vsz_mb))
 
     return sampled_data
 
@@ -205,21 +226,36 @@ def parse_rss_memory_log(log_file):
 def parse_result_dir_name(dir_name):
     """
     Parse result directory name to extract configuration.
-    Expected format: results-<suffix>-<thp>-<allocator>-<buffer_pool>
-    Example: results-ps-8.4.9-9-CUSTOM113-nothp-glibc-150G
+    The config always contains a THP token ('thp' or 'nothp') immediately
+    followed by the allocator, e.g.:
+        results-ps-8.4.9-9-CUSTOM113-nothp-glibc-150G
+        results-ps-8.4.9-nothp-glibc-150G-nobinlog-innodb-pool
+        results-ps-8.4.9-9-binlog-nothp-glibc-150G-binlog-innodb
+    Anchoring on the THP token keeps parsing correct regardless of any
+    trailing suffix (e.g. -nobinlog-innodb-pool) after the buffer pool.
     """
     parts = dir_name.split('-')
 
-    # Try to extract thp, allocator from the end
-    if len(parts) >= 3:
-        # Last part should be buffer pool (e.g., 150G)
-        buffer_pool = parts[-1]
-        # Second to last should be allocator
-        allocator = parts[-2]
-        # Third to last should be thp setting
-        thp = parts[-3]
-        # Everything else is the suffix
-        suffix = '-'.join(parts[1:-3])
+    # Locate the THP token; the allocator is the part right after it.
+    thp_idx = None
+    for i, part in enumerate(parts):
+        if part in ('thp', 'nothp'):
+            thp_idx = i
+            break
+
+    if thp_idx is not None and thp_idx + 1 < len(parts):
+        thp = parts[thp_idx]
+        allocator = parts[thp_idx + 1]
+
+        # Buffer pool: first "<number>G" token at or after the allocator.
+        buffer_pool = 'unknown'
+        for part in parts[thp_idx + 2:]:
+            if re.fullmatch(r'\d+G', part):
+                buffer_pool = part
+                break
+
+        # Suffix: everything before the THP token (minus the leading "results").
+        suffix = '-'.join(parts[1:thp_idx])
 
         return {
             'suffix': suffix,
@@ -307,7 +343,7 @@ def generate_html_report(qps_results, rss_results, output_file):
                 moving_avg_data.append({'x': uptime, 'y': round(avg_qps, 2)})
 
             avg_dataset = {
-                'label': f"{label} avg (25pt)",
+                'label': f"{label}",
                 'data': moving_avg_data,
                 'borderColor': color,
                 'backgroundColor': 'transparent',
@@ -327,16 +363,28 @@ def generate_html_report(qps_results, rss_results, output_file):
         color = colors[color_idx % len(colors)]
         color_idx += 1
 
-        dataset = {
-            'label': f"{config['label']} ({config['suffix']})",
-            'data': [{'x': elapsed, 'y': round(rss_mb, 2)} for _, elapsed, rss_mb in rss_data],
+        rss_dataset = {
+            'label': f"{config['label']} ({config['suffix']}) RSS",
+            'data': [{'x': elapsed, 'y': round(rss_mb, 2)} for _, elapsed, rss_mb, _ in rss_data],
             'borderColor': color,
             'backgroundColor': color.replace('rgb', 'rgba').replace(')', ', 0.1)'),
             'tension': 0.3,
             'pointRadius': 0,
             'borderWidth': 2,
         }
-        rss_datasets.append(dataset)
+        rss_datasets.append(rss_dataset)
+
+        vsz_dataset = {
+            'label': f"{config['label']} ({config['suffix']}) VSZ",
+            'data': [{'x': elapsed, 'y': round(vsz_mb, 2)} for _, elapsed, _, vsz_mb in rss_data],
+            'borderColor': color,
+            'backgroundColor': 'transparent',
+            'borderDash': [6, 4],
+            'tension': 0.3,
+            'pointRadius': 0,
+            'borderWidth': 2,
+        }
+        rss_datasets.append(vsz_dataset)
 
     html_content = f'''<!DOCTYPE html>
 <html lang="en">
@@ -355,7 +403,7 @@ def generate_html_report(qps_results, rss_results, output_file):
             background-color: #f5f5f5;
         }}
         .container {{
-            max-width: 1400px;
+            max-width: 890px;
             margin: 0 auto;
             background-color: white;
             padding: 30px;
@@ -373,7 +421,7 @@ def generate_html_report(qps_results, rss_results, output_file):
         }}
         .chart-container {{
             position: relative;
-            height: 1200px;
+            height: 600px;
             margin: 30px 0;
         }}
         .stats-table {{
@@ -412,7 +460,7 @@ def generate_html_report(qps_results, rss_results, output_file):
         .controls {{
             margin: 20px 0;
             padding: 15px;
-            background-color: #f9f9f9;
+            background-color: #ffffff;
             border-radius: 5px;
             border: 1px solid #ddd;
         }}
@@ -511,6 +559,7 @@ def generate_html_report(qps_results, rss_results, output_file):
             </div>
             <button id="zoomButton" class="zoom-button">Zoom In (Start at 40k)</button>
             <button id="resetZoomButton" class="reset-zoom-button">Reset Zoom</button>
+            <button id="toggleRawButton" class="zoom-button">Hide Raw Data (Average Only)</button>
             <div class="zoom-info">
                 💡 <strong>Tip:</strong> Click and drag on the graph to zoom into a specific area. Use the "Reset Zoom" button to return to full view.
             </div>
@@ -584,8 +633,7 @@ def generate_html_report(qps_results, rss_results, output_file):
                         }}
                     }},
                     legend: {{
-                        display: true,
-                        position: 'top',
+                        display: false
                     }},
                     tooltip: {{
                         callbacks: {{
@@ -650,14 +698,13 @@ def generate_html_report(qps_results, rss_results, output_file):
                 plugins: {{
                     title: {{
                         display: true,
-                        text: 'MySQL RSS Memory Usage (sampled every minute)',
+                        text: 'MySQL RSS / VSZ Memory Usage (sampled every minute)',
                         font: {{
                             size: 18
                         }}
                     }},
                     legend: {{
-                        display: true,
-                        position: 'top',
+                        display: false
                     }},
                     tooltip: {{
                         callbacks: {{
@@ -699,7 +746,7 @@ def generate_html_report(qps_results, rss_results, output_file):
                     y: {{
                         title: {{
                             display: true,
-                            text: 'RSS Memory (MB)'
+                            text: 'Memory (MB)'
                         }},
                         beginAtZero: true,
                         min: 0
@@ -761,7 +808,7 @@ def generate_html_report(qps_results, rss_results, output_file):
             configs.push({{
                 dataIndex: i,
                 avgIndex: i + 1,
-                label: dataDataset.label,
+                label: avgDataset.label,
                 enabled: true
             }});
         }}
@@ -776,7 +823,7 @@ def generate_html_report(qps_results, rss_results, output_file):
             checkbox.checked = true;
             checkbox.addEventListener('change', function() {{
                 // Toggle visibility of both raw data and average line
-                qpsChart.data.datasets[config.dataIndex].hidden = !this.checked;
+                qpsChart.data.datasets[config.dataIndex].hidden = !this.checked || !showRawData;
                 qpsChart.data.datasets[config.avgIndex].hidden = !this.checked;
                 qpsChart.update();
             }});
@@ -802,6 +849,20 @@ def generate_html_report(qps_results, rss_results, output_file):
             div.appendChild(checkbox);
             div.appendChild(label);
             checkboxGrid.appendChild(div);
+        }});
+
+        // Toggle raw (per-snapshot) data lines, leaving only the average lines
+        let showRawData = true;
+        const toggleRawButton = document.getElementById('toggleRawButton');
+        toggleRawButton.addEventListener('click', function() {{
+            showRawData = !showRawData;
+            configs.forEach((config, idx) => {{
+                const checkbox = document.getElementById(`graph-${{idx}}`);
+                const isChecked = checkbox ? checkbox.checked : true;
+                qpsChart.data.datasets[config.dataIndex].hidden = !isChecked || !showRawData;
+            }});
+            toggleRawButton.textContent = showRawData ? 'Hide Raw Data (Average Only)' : 'Show Raw Data';
+            qpsChart.update();
         }});
 
         // Zoom button functionality for QPS chart
@@ -1017,11 +1078,13 @@ Examples:
         print(f"  Sampled {len(rss_data)} data points (every minute)")
 
         if rss_data:
-            rss_values = [rss_mb for _, _, rss_mb in rss_data]
+            rss_values = [rss_mb for _, _, rss_mb, _ in rss_data]
+            vsz_values = [vsz_mb for _, _, _, vsz_mb in rss_data]
             min_rss = min(rss_values)
             max_rss = max(rss_values)
             avg_rss = sum(rss_values) / len(rss_values)
-            print(f"  Min RSS: {min_rss:.2f} MB, Max RSS: {max_rss:.2f} MB, Avg RSS: {avg_rss:.2f} MB")
+            avg_vsz = sum(vsz_values) / len(vsz_values)
+            print(f"  Min RSS: {min_rss:.2f} MB, Max RSS: {max_rss:.2f} MB, Avg RSS: {avg_rss:.2f} MB, Avg VSZ: {avg_vsz:.2f} MB")
 
             rss_results[dir_name] = rss_data
 
