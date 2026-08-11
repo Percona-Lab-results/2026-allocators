@@ -47,7 +47,7 @@ ulimit -n 65536
 log_info "Killing any existing mysqld processes..."
 sudo killall mysqld 2>/dev/null || true
 sleep 2
-sudo killall vmstat mpstat iostat 2>/dev/null || true
+sudo killall vmstat mpstat iostat turbostat 2>/dev/null || true
 
 # Parse named command line arguments
 SERVER_BINARY=""
@@ -725,6 +725,8 @@ trap_handler() {
     [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
     [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
     [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+    [ -n "${TURBOSTAT_PID}" ] && kill ${TURBOSTAT_PID} 2>/dev/null || true
+    sudo killall turbostat 2>/dev/null || true
 
     # Stop MySQL
     if kill -0 ${MYSQLD_PID} 2>/dev/null; then
@@ -766,6 +768,7 @@ GLOBAL_VARS_FILE="${RESULTS_DIR}/${FILE_PREFIX}_global_vars_${DATE_TIME}.log"
 VMSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_vmstat_${DATE_TIME}.log"
 IOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_iostat_${DATE_TIME}.log"
 MPSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_mpstat_${DATE_TIME}.log"
+TURBOSTAT_FILE="${RESULTS_DIR}/${FILE_PREFIX}_turbostat_${DATE_TIME}.log"
 
 # Add headers
 echo "# MySQL /proc/${MYSQLD_PID}/status data collection" > "${STATUS_FILE}"
@@ -812,6 +815,10 @@ echo "" >> "${IOSTAT_FILE}"
 echo "# mpstat per-CPU statistics (every 1 second)" > "${MPSTAT_FILE}"
 echo "# Started at: $(date)" >> "${MPSTAT_FILE}"
 echo "" >> "${MPSTAT_FILE}"
+
+echo "# turbostat per-CPU frequency/thermal statistics (every 30 seconds)" > "${TURBOSTAT_FILE}"
+echo "# Started at: $(date)" >> "${TURBOSTAT_FILE}"
+echo "" >> "${TURBOSTAT_FILE}"
 
 # Background data collection processes
 collect_proc_data() {
@@ -917,6 +924,8 @@ collect_rss_data() {
             [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
             [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
             [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+            [ -n "${TURBOSTAT_PID}" ] && kill ${TURBOSTAT_PID} 2>/dev/null || true
+            sudo killall turbostat 2>/dev/null || true
 
             exit 1
         fi
@@ -1011,6 +1020,24 @@ collect_mpstat() {
     kill ${mpstat_pid} 2>/dev/null || true
 }
 
+# turbostat per-CPU frequency/thermal statistics monitoring function
+collect_turbostat() {
+    local turbostat_file=$1
+    local mysqld_pid=$2
+    local hammerdb_pid=$3
+
+    # Per-CPU actual frequency (Avg_MHz/Bzy_MHz), C-states, temperatures,
+    # throttling counts and package power, sampled every 30 seconds
+    sudo turbostat --quiet --enable Time_Of_Day_Seconds --interval 30 >> "${turbostat_file}" 2>&1 &
+
+    while kill -0 ${mysqld_pid} 2>/dev/null && kill -0 ${hammerdb_pid} 2>/dev/null; do
+        sleep 5
+    done
+
+    # turbostat runs as root via sudo, so kill it with sudo
+    sudo killall turbostat 2>/dev/null || true
+}
+
 # Initialize background process PIDs
 COLLECTOR_PID=""
 RSS_COLLECTOR_PID=""
@@ -1018,6 +1045,7 @@ MYSQL_GLOBALS_PID=""
 VMSTAT_PID=""
 IOSTAT_PID=""
 MPSTAT_PID=""
+TURBOSTAT_PID=""
 
 # Start data collection in background
 collect_proc_data ${MYSQLD_PID} "${STATUS_FILE}" "${SMAPS_ROLLUP_FILE}" "${SMAPS_FILE}" "${STAT_FILE}" "${MAPS_FILE}" &
@@ -1043,6 +1071,10 @@ IOSTAT_PID=$!
 collect_mpstat "${MPSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
 MPSTAT_PID=$!
 
+# Start turbostat monitoring in background
+collect_turbostat "${TURBOSTAT_FILE}" ${MYSQLD_PID} ${HAMMERDB_PID} &
+TURBOSTAT_PID=$!
+
 # Time reporting loop
 LAST_REPORT=0
 while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
@@ -1065,6 +1097,8 @@ while kill -0 ${HAMMERDB_PID} 2>/dev/null; do
         [ -n "${VMSTAT_PID}" ] && kill ${VMSTAT_PID} 2>/dev/null || true
         [ -n "${IOSTAT_PID}" ] && kill ${IOSTAT_PID} 2>/dev/null || true
         [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
+        [ -n "${TURBOSTAT_PID}" ] && kill ${TURBOSTAT_PID} 2>/dev/null || true
+        sudo killall turbostat 2>/dev/null || true
         exit 1
     fi
 
@@ -1126,6 +1160,10 @@ HAMMERDB_EXIT=$?
 
 [ -n "${MPSTAT_PID}" ] && kill ${MPSTAT_PID} 2>/dev/null || true
 [ -n "${MPSTAT_PID}" ] && wait ${MPSTAT_PID} 2>/dev/null || true
+
+[ -n "${TURBOSTAT_PID}" ] && kill ${TURBOSTAT_PID} 2>/dev/null || true
+sudo killall turbostat 2>/dev/null || true
+[ -n "${TURBOSTAT_PID}" ] && wait ${TURBOSTAT_PID} 2>/dev/null || true
 
 log_info "Benchmark completed (exit code: ${HAMMERDB_EXIT})"
 
