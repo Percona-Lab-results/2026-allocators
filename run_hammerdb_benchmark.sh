@@ -17,6 +17,7 @@ MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
 BENCHMARK_DURATION_MINUTES=1200  # 20 hours = 1200 minutes
 RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
+CPU_MAX_FREQ_MHZ=2500            # Cap turbo boost so all nodes run at the same sustained frequency
 
 # Colors for output
 RED='\033[0;31m'
@@ -225,6 +226,24 @@ sed -i -E "s/^([[:space:]]*diset[[:space:]]+tpcc[[:space:]]+mysql_storage_engine
 # 2. Set CPU governor to performance mode and disable CPU idle state
 log_info "Setting CPU governor to performance mode..."
 sudo cpupower frequency-set -g performance 2>/dev/null || log_warn "Could not set CPU governor (cpupower not available or insufficient permissions)"
+
+log_info "Limiting CPU max (turbo) frequency to ${CPU_MAX_FREQ_MHZ} MHz..."
+if ! sudo cpupower frequency-set -u "${CPU_MAX_FREQ_MHZ}MHz" > /dev/null 2>&1; then
+    log_warn "cpupower could not set max frequency, falling back to sysfs scaling_max_freq"
+    for max_freq in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+        if [ -f "$max_freq" ]; then
+            echo $((CPU_MAX_FREQ_MHZ * 1000)) | sudo tee "$max_freq" > /dev/null 2>&1 || true
+        fi
+    done
+fi
+
+# Verify the cap took effect on cpu0 (value is in kHz)
+ACTUAL_MAX_KHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo "")
+if [ -n "${ACTUAL_MAX_KHZ}" ] && [ "${ACTUAL_MAX_KHZ}" -eq $((CPU_MAX_FREQ_MHZ * 1000)) ]; then
+    log_info "CPU max frequency capped at $((ACTUAL_MAX_KHZ / 1000)) MHz"
+else
+    log_warn "CPU max frequency cap not confirmed (scaling_max_freq: ${ACTUAL_MAX_KHZ:-unavailable} kHz, expected $((CPU_MAX_FREQ_MHZ * 1000)) kHz)"
+fi
 
 log_info "Disabling CPU idle states..."
 for cpu_idle in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
