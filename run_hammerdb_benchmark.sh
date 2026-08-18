@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # HammerDB TPC-C Benchmark Script for MySQL/Percona Server
-# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--thread-pool=yes|no]
+# Usage: ./run_hammerdb_benchmark.sh --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks [--thread-pool=yes|no] [--max-freq=MHZ]
 #
 # Examples:
 #   ./run_hammerdb_benchmark.sh --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb
@@ -17,7 +17,7 @@ MYSQL_SOCKET="/tmp/mysql-alloc-test.sock"
 BENCHMARK_DURATION_MINUTES=1200  # 20 hours = 1200 minutes
 RAMPUP_DURATION_MINUTES=15       # Ramp-up time before benchmark starts
 VIRTUAL_USERS=80
-CPU_MAX_FREQ_MHZ=2500            # Cap turbo boost so all nodes run at the same sustained frequency
+CPU_MAX_FREQ_MHZ=2400            # Cap turbo boost so all nodes run at the same sustained frequency (override with --max-freq=MHZ)
 
 # Colors for output
 RED='\033[0;31m'
@@ -119,6 +119,10 @@ for arg in "$@"; do
             esac
             shift
             ;;
+        --max-freq=*)
+            CPU_MAX_FREQ_MHZ="${arg#*=}"
+            shift
+            ;;
         *)
             log_error "Unknown argument: $arg"
             exit 1
@@ -130,7 +134,7 @@ done
 if [ -z "${SERVER_BINARY}" ] || [ -z "${THP_ENABLED}" ] || [ -z "${ALLOCATOR}" ] || \
    [ -z "${SKIP_INIT}" ] || [ -z "${BUFFER_POOL_SIZE_GB}" ] || [ -z "${RESULTS_SUFFIX}" ] || \
    [ -z "${ENABLE_BINLOG}" ] || [ -z "${STORAGE_ENGINE}" ] || [ -z "${THREAD_POOL}" ]; then
-    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks --thread-pool=yes|no"
+    log_error "Usage: $0 --server=/path/to/mysqld --thp=yes|no --allocator=glibc|jemalloc36|jemalloc53|tcmalloc --skip-init=yes|no --buffer-gb=N --results-suffix=<name> --binlog=yes|no --engine=innodb|myrocks --thread-pool=yes|no [--max-freq=MHZ]"
     log_error "Example: $0 --server=/opt/percona/bin/mysqld --thp=yes --allocator=jemalloc53 --skip-init=no --buffer-gb=110 --results-suffix=test1 --binlog=no --engine=innodb --thread-pool=no"
     exit 1
 fi
@@ -179,6 +183,17 @@ fi
 if [[ ! "${STORAGE_ENGINE}" =~ ^(innodb|myrocks)$ ]]; then
     log_error "Storage engine parameter must be 'innodb' or 'myrocks', got: ${STORAGE_ENGINE}"
     exit 1
+fi
+
+# Validate max frequency is a positive integer (in MHz)
+if ! [[ "${CPU_MAX_FREQ_MHZ}" =~ ^[0-9]+$ ]] || [ "${CPU_MAX_FREQ_MHZ}" -lt 1 ]; then
+    log_error "Max frequency must be a positive integer (in MHz), got: ${CPU_MAX_FREQ_MHZ}"
+    exit 1
+fi
+
+# P-states move in 100 MHz multiplier steps; a non-multiple cap oscillates between bins
+if [ $((CPU_MAX_FREQ_MHZ % 100)) -ne 0 ]; then
+    log_warn "Max frequency ${CPU_MAX_FREQ_MHZ} MHz is not a multiple of 100 MHz; the CPU will oscillate between adjacent P-state bins"
 fi
 
 # 1. Check if HammerDB 5.0 is installed
