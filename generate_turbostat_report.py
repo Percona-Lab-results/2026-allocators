@@ -88,15 +88,39 @@ def find_turbostat_logs(data_dir):
     return results
 
 
-def parse_node_number(dir_name):
+def detect_node_numbers(dir_names):
     """
-    Extract the node number from the glibc<N> token of the directory name
-    (N is the node number, not a glibc version).
+    Find the node number in each directory name: the number that changes
+    from directory to directory.
+
+    Directory naming differs between result sets (results-ps-8.4.10-1-...-glibc1-...,
+    results-ref5-...-glibc5-..., results-refa8-...-glibc-...), so no fixed token
+    can be relied on. Instead all numbers are extracted from every name in order,
+    and the first position whose value varies across directories is taken as the
+    node number (constant positions are version/size tokens like 8.4.10 or 150G).
+
+    Returns {dir_name: node_number}; falls back to the glibc<N> token, then the
+    first number in the name, when variation cannot be established (e.g. a
+    single directory).
     """
-    match = re.search(r'glibc(\d+)', dir_name)
-    if match:
-        return int(match.group(1))
-    return None
+    numbers = {name: re.findall(r'\d+', name) for name in dir_names}
+
+    counts = {len(v) for v in numbers.values()}
+    if len(dir_names) > 1 and len(counts) == 1:
+        for idx in range(counts.pop()):
+            if len({numbers[name][idx] for name in dir_names}) > 1:
+                return {name: int(numbers[name][idx]) for name in dir_names}
+
+    result = {}
+    for name in dir_names:
+        match = re.search(r'glibc(\d+)', name)
+        if match:
+            result[name] = int(match.group(1))
+        elif numbers[name]:
+            result[name] = int(numbers[name][0])
+        else:
+            result[name] = None
+    return result
 
 
 def moving_average(data, value_idx, window_size=25):
@@ -148,7 +172,7 @@ def generate_html_report(node_results, output_file):
             continue
 
         color = PALETTE[(node - 1) % len(PALETTE)]
-        label = f"node{node}"
+        label = f"Node-{node}"
 
         # Raw Bzy_MHz line (semi-transparent)
         freq_datasets.append({
@@ -686,15 +710,21 @@ Examples:
 
     print(f"Found {len(log_files)} result directories with turbostat logs.")
 
+    node_map = detect_node_numbers(sorted(log_files.keys()))
+
     node_results = {}
 
     for dir_name, log_file in sorted(log_files.items()):
-        node = parse_node_number(dir_name)
+        node = node_map.get(dir_name)
         if node is None:
-            print(f"\nSkipping {dir_name} (no glibc<N> node token in name)")
+            print(f"\nSkipping {dir_name} (no number found in directory name)")
+            continue
+        if node in node_results:
+            print(f"\nSkipping {dir_name} (node {node} already taken by "
+                  f"{node_results[node]['dir_name']})")
             continue
 
-        print(f"\nProcessing node{node}: {dir_name}")
+        print(f"\nProcessing Node-{node}: {dir_name}")
         print(f"  Log file: {os.path.basename(log_file)}")
 
         data = parse_turbostat_log(log_file)
