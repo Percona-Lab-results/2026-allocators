@@ -408,14 +408,44 @@ innodb_doublewrite = OFF
 EOF
 fi
 
-# 5.1. Add large-pages=ON if THP is enabled
-if [ "${THP_ENABLED}" = "thp" ]; then
-    log_info "Transparent Huge Pages enabled - adding large-pages=ON to my.cnf"
-    cat >> "${MY_CNF}" <<EOF
+# 5.1. Configure kernel Transparent Huge Pages via sysfs (before mysqld starts).
+# Note: large-pages=ON in my.cnf is a different mechanism (explicit HugeTLB
+# pages, requires vm.nr_hugepages) and must NOT be used for THP runs.
+THP_SYSFS="/sys/kernel/mm/transparent_hugepage/enabled"
+THP_RESTORE_VALUE="madvise"
 
-# Transparent Huge Pages
-large-pages = ON
-EOF
+restore_thp() {
+    log_info "Restoring THP setting to '${THP_RESTORE_VALUE}'..."
+    echo "${THP_RESTORE_VALUE}" | sudo tee "${THP_SYSFS}" > /dev/null 2>&1 || \
+        log_warn "Failed to restore THP setting to '${THP_RESTORE_VALUE}' (${THP_SYSFS})"
+}
+
+set_thp() {
+    local value=$1
+    # "sudo echo value > file" would redirect as the current user; use sudo tee
+    echo "${value}" | sudo tee "${THP_SYSFS}" > /dev/null || {
+        log_error "Failed to set THP to '${value}' (sudo write to ${THP_SYSFS})"
+        exit 1
+    }
+    # From this point on, always restore the default on any exit path
+    # (normal completion, error, INT/TERM via trap_handler's exit)
+    trap restore_thp EXIT
+
+    local active
+    active=$(cat "${THP_SYSFS}")
+    log_info "Kernel THP setting: ${active}"
+    if [[ "${active}" != *"[${value}]"* ]]; then
+        log_error "THP setting did not take effect (wanted '${value}', got '${active}')"
+        exit 1
+    fi
+}
+
+if [ "${THP_ENABLED}" = "thp" ]; then
+    log_info "Enabling Transparent Huge Pages (THP=always)..."
+    set_thp always
+else
+    log_info "Disabling Transparent Huge Pages (THP=never)..."
+    set_thp never
 fi
 
 log_info "Configuration file created successfully"
@@ -670,6 +700,9 @@ fi
 
 # Create results directory
 mkdir -p "${RESULTS_DIR}"
+
+# Record the active kernel THP setting so the run is self-documenting
+cat "${THP_SYSFS}" > "${RESULTS_DIR}/${THP_ENABLED}_${ALLOCATOR}_thp_setting.log" 2>/dev/null || true
 
 # Create HammerDB run script for TPC-C test
 HAMMERDB_RUN_TCL="${SCRIPT_DIR}/hammerdb_run.tcl"
