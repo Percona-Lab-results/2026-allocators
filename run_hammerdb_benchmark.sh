@@ -789,9 +789,8 @@ HAMMERDB_PID=$!
 trap_handler() {
     log_warn "Received termination signal, stopping benchmark gracefully..."
     if kill -0 ${HAMMERDB_PID} 2>/dev/null; then
-        log_info "Sending SIGINT to HammerDB (PID: ${HAMMERDB_PID}) to generate summary..."
-        kill -INT ${HAMMERDB_PID} 2>/dev/null || true
-        log_info "Waiting for HammerDB to finish writing summary..."
+        log_info "Killing HammerDB (PID: ${HAMMERDB_PID})..."
+        kill -9 ${HAMMERDB_PID} 2>/dev/null || true
         wait ${HAMMERDB_PID} 2>/dev/null || true
     fi
 
