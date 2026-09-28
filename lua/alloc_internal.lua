@@ -22,6 +22,7 @@ sysbench.cmdline.options = {
     tables = {"Number of stress tables in schema allocstress", 128},
     rows = {"Rows per stress table", 500},
     flush_every = {"FLUSH TABLES every N events on thread 0 (0 = off)", 0},
+    engine = {"Storage engine for stress tables (innodb|rocksdb)", "innodb"},
 }
 
 local DB = "allocstress"
@@ -38,7 +39,7 @@ CREATE TABLE IF NOT EXISTS %s (
   grp INT NOT NULL,
   filler VARCHAR(200) NOT NULL,
   KEY (grp)
-) ENGINE=InnoDB]], t))
+) ENGINE=%s]], t, sysbench.opt.engine))
     local ok, count = pcall(function()
         return con:query_row("SELECT COUNT(*) FROM " .. t)
     end)
@@ -109,7 +110,8 @@ local function b_ddl_churn()
     local t = string.format("%s.ddl_%d", DB, sysbench.tid)
     con:query("DROP TABLE IF EXISTS " .. t)
     con:query(string.format([[
-CREATE TABLE %s (id INT PRIMARY KEY, v VARCHAR(64), KEY (v)) ENGINE=InnoDB]], t))
+CREATE TABLE %s (id INT PRIMARY KEY, v VARCHAR(64), KEY (v)) ENGINE=%s]],
+        t, sysbench.opt.engine))
     con:query(string.format(
         "INSERT INTO %s VALUES (1, 'x'), (2, 'y'), (3, 'z')", t))
     con:query("DROP TABLE " .. t)

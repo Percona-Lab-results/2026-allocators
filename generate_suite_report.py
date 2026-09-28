@@ -37,7 +37,8 @@ def ts(s):
 
 def find_run_dirs(suite_dir):
     """Find run directories at any depth up to 2 below suite_dir."""
-    pat = re.compile(r'^results-.*-(thp|nothp)-(\w+)-rep(\d+)-\d+G$')
+    # Optional trailing storage-engine token (e.g. -48G-myrocks)
+    pat = re.compile(r'^results-.*-(thp|nothp)-(\w+)-rep(\d+)-\d+G(?:-\w+)?$')
     runs = []
     for root in (suite_dir, *glob.glob(os.path.join(suite_dir, '*'))):
         if not os.path.isdir(root):

@@ -28,9 +28,17 @@
 #       --allocators=glibc,jemalloc36,jemalloc53,tcmalloc \
 #       --thp=yes|no --reps=3 --buffer-gb=48 --results-suffix=allocperf \
 #       [--warehouses=400] [--skip-init=yes|no] [--snapshot=yes|no] \
+#       [--engine=innodb|myrocks] \
 #       [--vu=80] [--stress-clients=8] [--stress-engine=bash|sysbench] \
 #       [--steady-minutes=60] [--idle-minutes=30] [--regrow-minutes=60] \
 #       [--rampup-minutes=10] [--max-freq=2400]
+#
+# --engine selects the storage engine (default innodb). With myrocks the
+# buffer size (--buffer-gb) becomes the RocksDB block cache, the load
+# script builds ROCKSDB tables, the sysbench alloc_internal stress tables
+# use ROCKSDB too, and mysqld gets lib/private on LD_LIBRARY_PATH.
+# Snapshots are kept per engine (data-snapshot-<engine>); use
+# --skip-init=no when switching engines.
 #
 # --stress-engine selects the malloc-stress generator that runs alongside
 # HammerDB during the loaded phases:
@@ -74,6 +82,7 @@ VIRTUAL_USERS=80
 STRESS_CLIENTS=8
 STRESS_ENGINE="bash"
 SYSBENCH_BIN="sysbench"
+STORAGE_ENGINE="innodb"
 STEADY_MINUTES=60
 IDLE_MINUTES=30
 REGROW_MINUTES=60
@@ -107,6 +116,7 @@ for arg in "$@"; do
         --vu=*)              VIRTUAL_USERS="${arg#*=}" ;;
         --stress-clients=*)  STRESS_CLIENTS="${arg#*=}" ;;
         --stress-engine=*)   STRESS_ENGINE="${arg#*=}" ;;
+        --engine=*)          STORAGE_ENGINE="${arg#*=}" ;;
         --steady-minutes=*)  STEADY_MINUTES="${arg#*=}" ;;
         --idle-minutes=*)    IDLE_MINUTES="${arg#*=}" ;;
         --regrow-minutes=*)  REGROW_MINUTES="${arg#*=}" ;;
@@ -144,6 +154,26 @@ if [[ ! "${STRESS_ENGINE}" =~ ^(bash|sysbench)$ ]]; then
     log_error "--stress-engine must be bash or sysbench, got: ${STRESS_ENGINE}"
     exit 1
 fi
+if [[ ! "${STORAGE_ENGINE}" =~ ^(innodb|myrocks)$ ]]; then
+    log_error "--engine must be innodb or myrocks, got: ${STORAGE_ENGINE}"
+    exit 1
+fi
+
+# MyRocks needs the server's private libs (abseil/protobuf) on the loader path
+MYSQLD_LD_LIBRARY_PATH=""
+if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+    SERVER_DIR=$(dirname "$(dirname "${SERVER_BINARY}")")
+    PRIVATE_LIB_DIR="${SERVER_DIR}/lib/private"
+    if [ ! -d "${PRIVATE_LIB_DIR}" ]; then
+        log_error "MyRocks requires private library directory: ${PRIVATE_LIB_DIR}"
+        exit 1
+    fi
+    MYSQLD_LD_LIBRARY_PATH="${PRIVATE_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+# Snapshots are engine-specific: data loaded for one engine is not valid
+# for the other
+SNAPSHOT_DIR="${SNAPSHOT_DIR}-${STORAGE_ENGINE}"
 if [ "${STRESS_ENGINE}" = "sysbench" ]; then
     if ! command -v "${SYSBENCH_BIN}" > /dev/null 2>&1; then
         log_error "sysbench not found (install with: sudo apt-get install sysbench)"
@@ -287,6 +317,51 @@ max_connections = 2000
 back_log = 1500
 
 skip-log-bin
+
+# performance_schema memory instrumentation = allocator-independent
+# "live bytes" reference for RSS overhead calculations
+performance_schema = ON
+EOF
+
+    if [ "${STORAGE_ENGINE}" = "myrocks" ]; then
+        # Same MyRocks tuning as run_hammerdb_benchmark.sh; --buffer-gb
+        # sizes the block cache (deliberately small so allocator behavior,
+        # not the cache, dominates per-query memory traffic).
+        cat >> "${MY_CNF}" <<EOF
+
+# MyRocks storage engine
+plugin-load=rocksdb=ha_rocksdb.so;rocksdb_cfstats=ha_rocksdb.so;rocksdb_dbstats=ha_rocksdb.so;rocksdb_perf_context=ha_rocksdb.so;rocksdb_perf_context_global=ha_rocksdb.so;rocksdb_cf_options=ha_rocksdb.so;rocksdb_compaction_stats=ha_rocksdb.so;rocksdb_global_info=ha_rocksdb.so;rocksdb_ddl=ha_rocksdb.so;rocksdb_index_file_map=ha_rocksdb.so;rocksdb_locks=ha_rocksdb.so;rocksdb_trx=ha_rocksdb.so
+default-storage-engine = ROCKSDB
+transaction-isolation = READ-COMMITTED
+rocksdb_block_cache_size = ${BUFFER_POOL_SIZE_GB}G
+rocksdb_max_open_files=-1
+rocksdb_max_background_jobs=8
+rocksdb_max_total_wal_size=4G
+rocksdb_block_size=16384
+rocksdb_table_cache_numshardbits=6
+
+# rate limiter
+rocksdb_bytes_per_sync=16777216
+rocksdb_wal_bytes_per_sync=4194304
+
+rocksdb_compaction_sequential_deletes_count_sd=1
+rocksdb_compaction_sequential_deletes=199999
+rocksdb_compaction_sequential_deletes_window=200000
+
+rocksdb_default_cf_options="write_buffer_size=256m;target_file_size_base=32m;max_bytes_for_level_base=512m;max_write_buffer_number=4;level0_file_num_compaction_trigger=4;level0_slowdown_writes_trigger=20;level0_stop_writes_trigger=30;max_write_buffer_number=4;block_based_table_factory={cache_index_and_filter_blocks=1;filter_policy=bloomfilter:10:false;whole_key_filtering=0};level_compaction_dynamic_level_bytes=true;optimize_filters_for_hits=true;memtable_prefix_bloom_size_ratio=0.05;prefix_extractor=capped:12;compaction_pri=kMinOverlappingRatio;compression=kLZ4Compression;bottommost_compression=kLZ4Compression;compression_opts=-14:4:0"
+
+rocksdb_max_subcompactions=4
+rocksdb_compaction_readahead_size=16m
+
+rocksdb_use_direct_reads=ON
+rocksdb_use_direct_io_for_flush_and_compaction=ON
+EOF
+        log_info "Wrote ${MY_CNF} (MyRocks, block cache ${BUFFER_POOL_SIZE_GB}G)"
+    else
+        cat >> "${MY_CNF}" <<EOF
+
+# InnoDB storage engine
+default-storage-engine = InnoDB
 innodb_flush_log_at_trx_commit = 0
 innodb_flush_method = O_DIRECT
 innodb_log_buffer_size = 256M
@@ -297,12 +372,9 @@ innodb_io_capacity = 20000
 # should dominate per-query memory traffic.
 innodb_buffer_pool_size = ${BUFFER_POOL_SIZE_GB}G
 innodb_buffer_pool_instances = 8
-
-# performance_schema memory instrumentation = allocator-independent
-# "live bytes" reference for RSS overhead calculations
-performance_schema = ON
 EOF
-    log_info "Wrote ${MY_CNF} (buffer pool ${BUFFER_POOL_SIZE_GB}G)"
+        log_info "Wrote ${MY_CNF} (InnoDB, buffer pool ${BUFFER_POOL_SIZE_GB}G)"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -310,6 +382,8 @@ EOF
 # ---------------------------------------------------------------------------
 write_load_tcl() {
     local load_vu=$(( WAREHOUSES < VIRTUAL_USERS ? WAREHOUSES : VIRTUAL_USERS ))
+    local hdb_engine="innodb"
+    [ "${STORAGE_ENGINE}" = "myrocks" ] && hdb_engine="rocksdb"
     cat > "${HAMMERDB_LOAD_TCL}" <<EOF
 #!/usr/bin/tclsh
 # Generated by run_allocator_perf_suite.sh - do not edit, will be overwritten.
@@ -326,7 +400,7 @@ diset connection mysql_ssl false
 diset tpcc mysql_user tpcuser
 diset tpcc mysql_pass tpcpass
 diset tpcc mysql_dbase tpcc
-diset tpcc mysql_storage_engine innodb
+diset tpcc mysql_storage_engine ${hdb_engine}
 diset tpcc mysql_history_pk true
 diset tpcc mysql_no_stored_procs true
 diset tpcc mysql_partition true
@@ -338,7 +412,7 @@ puts "SCHEMA BUILD STARTED"
 set ret [buildschema]
 puts "SCHEMA BUILD COMPLETED: \$ret"
 EOF
-    log_info "Wrote ${HAMMERDB_LOAD_TCL} (${WAREHOUSES} warehouses, ${load_vu} loader VUs)"
+    log_info "Wrote ${HAMMERDB_LOAD_TCL} (${WAREHOUSES} warehouses, ${load_vu} loader VUs, engine ${hdb_engine})"
 }
 
 # ---------------------------------------------------------------------------
@@ -375,17 +449,19 @@ start_mysqld() {
     local preload
     preload=$(allocator_preload "${allocator}")
 
+    local envs=()
     if [ -n "${preload}" ]; then
         if [ ! -f "${preload}" ]; then
             log_error "Allocator library not found: ${preload}"
             return 1
         fi
+        envs+=("LD_PRELOAD=${preload}")
         log_info "Starting mysqld with LD_PRELOAD=${preload}"
-        LD_PRELOAD="${preload}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
     else
         log_info "Starting mysqld with glibc malloc"
-        "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
     fi
+    [ -n "${MYSQLD_LD_LIBRARY_PATH}" ] && envs+=("LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH}")
+    env "${envs[@]}" "${SERVER_BINARY}" --defaults-file="${MY_CNF}" --user=$(whoami) &
     MYSQLD_PID=$!
 
     for i in {1..300}; do
@@ -417,8 +493,10 @@ initial_load() {
     log_info "Initializing fresh data directory and loading TPC-C schema..."
     rm -rf "${SERVER_DATA_DIR}"
     mkdir -p "${SERVER_DATA_DIR}"
-    "${SERVER_BINARY}" --no-defaults --initialize-insecure --user=$(whoami) \
-        --datadir="${SERVER_DATA_DIR}" || return 1
+    local init_envs=()
+    [ -n "${MYSQLD_LD_LIBRARY_PATH}" ] && init_envs+=("LD_LIBRARY_PATH=${MYSQLD_LD_LIBRARY_PATH}")
+    env "${init_envs[@]}" "${SERVER_BINARY}" --no-defaults --initialize-insecure \
+        --user=$(whoami) --datadir="${SERVER_DATA_DIR}" || return 1
 
     start_mysqld glibc || return 1
     "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root <<EOF || return 1
@@ -567,8 +645,10 @@ start_stress_clients() {
         start_sysbench_script alloc_query "${query_t}" "${logbase}_query.log" \
             --reconnect_every=50
         start_sysbench_script alloc_conn "${conn_t}" "${logbase}_conn.log"
+        local int_engine="innodb"
+        [ "${STORAGE_ENGINE}" = "myrocks" ] && int_engine="rocksdb"
         start_sysbench_script alloc_internal "${int_t}" "${logbase}_internal.log" \
-            --tables=128 --rows=500
+            --tables=128 --rows=500 --engine="${int_engine}"
         return
     fi
 
@@ -645,7 +725,7 @@ check_thp_effective() {
 run_one() {
     local allocator=$1 rep=$2
     local prefix="${THP_ENABLED}_${allocator}"
-    local results_dir="${SUITE_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${allocator}-rep${rep}-${BUFFER_POOL_SIZE_GB}G"
+    local results_dir="${SUITE_DIR}/results-${RESULTS_SUFFIX}-${THP_ENABLED}-${allocator}-rep${rep}-${BUFFER_POOL_SIZE_GB}G-${STORAGE_ENGINE}"
     local dt run_flag phases_csv
 
     log_info "================================================================"
@@ -670,6 +750,7 @@ run_one() {
         echo "thp=$(cat ${THP_SYSFS})"
         echo "rep=${rep}"
         echo "buffer_pool_gb=${BUFFER_POOL_SIZE_GB}"
+        echo "storage_engine=${STORAGE_ENGINE}"
         echo "warehouses=${WAREHOUSES}"
         echo "vu=${VIRTUAL_USERS}"
         echo "stress_clients=${STRESS_CLIENTS}"
@@ -798,7 +879,7 @@ PYEOF
 # Suite main
 # ---------------------------------------------------------------------------
 log_info "Allocator performance suite: allocators=[${ALLOCATORS}] thp=${THP_MODE} reps=${REPS}"
-log_info "Dataset: ${WAREHOUSES} warehouses (~${WAREHOUSE_DATA_GB}G), buffer pool ${BUFFER_POOL_SIZE_GB}G"
+log_info "Dataset: ${WAREHOUSES} warehouses (~${WAREHOUSE_DATA_GB}G), engine ${STORAGE_ENGINE}, buffer/cache ${BUFFER_POOL_SIZE_GB}G"
 log_info "Phases per run: steady ${STEADY_MINUTES}m -> idle ${IDLE_MINUTES}m -> regrow ${REGROW_MINUTES}m (+ 2x ${RAMPUP_MINUTES}m rampup)"
 log_info "Suite directory: ${SUITE_DIR}"
 
