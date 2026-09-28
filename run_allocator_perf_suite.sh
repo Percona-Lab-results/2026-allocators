@@ -28,9 +28,21 @@
 #       --allocators=glibc,jemalloc36,jemalloc53,tcmalloc \
 #       --thp=yes|no --reps=3 --buffer-gb=48 --results-suffix=allocperf \
 #       [--warehouses=400] [--skip-init=yes|no] [--snapshot=yes|no] \
-#       [--vu=80] [--stress-clients=8] \
+#       [--vu=80] [--stress-clients=8] [--stress-engine=bash|sysbench] \
 #       [--steady-minutes=60] [--idle-minutes=30] [--regrow-minutes=60] \
 #       [--rampup-minutes=10] [--max-freq=2400]
+#
+# --stress-engine selects the malloc-stress generator that runs alongside
+# HammerDB during the loaded phases:
+#   bash     - mysql-client loops (big sorts / GROUP_CONCAT / PS churn),
+#              one process per iteration for connection cycling (default)
+#   sysbench - Lua scripts in lua/: alloc_conn.lua (connect/disconnect,
+#              net-buffer balloon), alloc_query.lua (randomized sort/join/
+#              tmp buffers, binary-protocol PS churn, big IN-lists),
+#              alloc_internal.lua (table-cache churn, lock heaps, purge
+#              pressure, DDL churn in its own allocstress schema).
+#              --stress-clients is the total thread budget split ~2:1:1
+#              between query, conn and internal scripts.
 #
 # The dataset (--warehouses, ~100 MB each) should fit in the buffer pool
 # with headroom so runs are CPU-bound and allocator differences are not
@@ -60,6 +72,8 @@ BUFFER_POOL_SIZE_GB=48
 WAREHOUSES=400
 VIRTUAL_USERS=80
 STRESS_CLIENTS=8
+STRESS_ENGINE="bash"
+SYSBENCH_BIN="sysbench"
 STEADY_MINUTES=60
 IDLE_MINUTES=30
 REGROW_MINUTES=60
@@ -92,6 +106,7 @@ for arg in "$@"; do
         --warehouses=*)      WAREHOUSES="${arg#*=}" ;;
         --vu=*)              VIRTUAL_USERS="${arg#*=}" ;;
         --stress-clients=*)  STRESS_CLIENTS="${arg#*=}" ;;
+        --stress-engine=*)   STRESS_ENGINE="${arg#*=}" ;;
         --steady-minutes=*)  STEADY_MINUTES="${arg#*=}" ;;
         --idle-minutes=*)    IDLE_MINUTES="${arg#*=}" ;;
         --regrow-minutes=*)  REGROW_MINUTES="${arg#*=}" ;;
@@ -124,6 +139,22 @@ fi
 if [[ ! "${WAREHOUSES}" =~ ^[0-9]+$ ]] || [ "${WAREHOUSES}" -lt 1 ]; then
     log_error "--warehouses must be a positive integer, got: ${WAREHOUSES}"
     exit 1
+fi
+if [[ ! "${STRESS_ENGINE}" =~ ^(bash|sysbench)$ ]]; then
+    log_error "--stress-engine must be bash or sysbench, got: ${STRESS_ENGINE}"
+    exit 1
+fi
+if [ "${STRESS_ENGINE}" = "sysbench" ]; then
+    if ! command -v "${SYSBENCH_BIN}" > /dev/null 2>&1; then
+        log_error "sysbench not found (install with: sudo apt-get install sysbench)"
+        exit 1
+    fi
+    for s in alloc_conn alloc_query alloc_internal; do
+        if [ ! -f "${SCRIPT_DIR}/lua/${s}.lua" ]; then
+            log_error "Missing stress script: ${SCRIPT_DIR}/lua/${s}.lua"
+            exit 1
+        fi
+    done
 fi
 # ~100 MB per warehouse; the dataset should fit in the pool with headroom
 WAREHOUSE_DATA_GB=$((WAREHOUSES / 10))
@@ -169,8 +200,10 @@ stop_stress_clients() {
         [ -n "$p" ] && kill "$p" 2>/dev/null || true
     done
     STRESS_PIDS=()
-    # Kill any stress mysql clients still connecting
+    # Kill any stress mysql clients still connecting (bash engine)
     pkill -f "allocator-stress-marker" 2>/dev/null || true
+    # Kill any sysbench stress runs (sysbench engine)
+    pkill -f "lua/alloc_(conn|query|internal)\.lua" 2>/dev/null || true
 }
 
 restore_thp() {
@@ -504,7 +537,41 @@ SELECT LENGTH(JSON_ARRAYAGG(JSON_OBJECT('c', c_city, 'b', c_balance)))
     done
 }
 
+# Launch one sysbench stress script in the background, running until killed
+start_sysbench_script() {
+    local script=$1 threads=$2 logfile=$3
+    shift 3
+    "${SYSBENCH_BIN}" "${SCRIPT_DIR}/lua/${script}.lua" \
+        --db-driver=mysql \
+        --mysql-socket="${MYSQL_SOCKET}" \
+        --mysql-user=tpcuser --mysql-password=tpcpass --mysql-db=tpcc \
+        --mysql-ignore-errors=all \
+        --threads="${threads}" --time=0 --events=0 \
+        --report-interval=60 --rand-type=uniform \
+        "$@" run > "${logfile}" 2>&1 &
+    STRESS_PIDS+=($!)
+    log_info "Started ${script}.lua: ${threads} threads (log: $(basename "${logfile}"))"
+}
+
+# Usage: start_stress_clients <logbase>  (logbase used by the sysbench engine)
 start_stress_clients() {
+    local logbase=$1
+
+    if [ "${STRESS_ENGINE}" = "sysbench" ]; then
+        # Split the thread budget ~2:1:1 across query / conn / internal
+        local conn_t=$(( STRESS_CLIENTS / 4 )); [ "${conn_t}" -lt 1 ] && conn_t=1
+        local int_t=$(( STRESS_CLIENTS / 4 ));  [ "${int_t}" -lt 1 ] && int_t=1
+        local query_t=$(( STRESS_CLIENTS - conn_t - int_t ))
+        [ "${query_t}" -lt 1 ] && query_t=1
+
+        start_sysbench_script alloc_query "${query_t}" "${logbase}_query.log" \
+            --reconnect_every=50
+        start_sysbench_script alloc_conn "${conn_t}" "${logbase}_conn.log"
+        start_sysbench_script alloc_internal "${int_t}" "${logbase}_internal.log" \
+            --tables=128 --rows=500
+        return
+    fi
+
     local warehouses
     warehouses=$("${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -N -B \
         -e "SELECT COUNT(*) FROM tpcc.warehouse" 2>/dev/null)
@@ -606,6 +673,7 @@ run_one() {
         echo "warehouses=${WAREHOUSES}"
         echo "vu=${VIRTUAL_USERS}"
         echo "stress_clients=${STRESS_CLIENTS}"
+        echo "stress_engine=${STRESS_ENGINE}"
         echo "phases=steady:${STEADY_MINUTES}m,idle:${IDLE_MINUTES}m,regrow:${REGROW_MINUTES}m"
         echo "rampup=${RAMPUP_MINUTES}m"
         grep 'LD_PRELOAD\|libjemalloc\|libtcmalloc' "/proc/${MYSQLD_PID}/maps" 2>/dev/null | head -2
@@ -622,7 +690,7 @@ run_one() {
     run_hammerdb_phase "steady" "${STEADY_MINUTES}" "${RAMPUP_MINUTES}" \
         "${results_dir}/${prefix}_hammerdb_steady_${dt}.log"
     sleep 30
-    start_stress_clients
+    start_stress_clients "${results_dir}/${prefix}_stress_steady_${dt}"
 
     # THP must be observable a few minutes into load
     if [ "${THP_MODE}" = "yes" ]; then
@@ -650,7 +718,7 @@ run_one() {
     run_hammerdb_phase "regrow" "${REGROW_MINUTES}" "${RAMPUP_MINUTES}" \
         "${results_dir}/${prefix}_hammerdb_regrow_${dt}.log"
     sleep 30
-    start_stress_clients
+    start_stress_clients "${results_dir}/${prefix}_stress_regrow_${dt}"
     wait ${HAMMERDB_PID} 2>/dev/null
     HAMMERDB_PID=""
     stop_stress_clients
