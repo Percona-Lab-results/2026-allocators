@@ -33,6 +33,10 @@
 #       [--steady-minutes=60] [--idle-minutes=30] [--regrow-minutes=60] \
 #       [--rampup-minutes=10] [--max-freq=2400]
 #
+# --idle-minutes=0 / --regrow-minutes=0 skip those phases, e.g. a plain
+# warmup+run benchmark: --rampup-minutes=10 --steady-minutes=30 \
+#   --idle-minutes=0 --regrow-minutes=0
+#
 # --engine selects the storage engine (default innodb). With myrocks the
 # buffer size (--buffer-gb) becomes the RocksDB block cache, the load
 # script builds ROCKSDB tables, the sysbench alloc_internal stress tables
@@ -538,6 +542,7 @@ run_collectors() {
     local smaps="${results_dir}/${prefix}_mysql_smaps_${dt}.log"
     local rss="${results_dir}/${prefix}_rss_memory_${dt}.log"
     local psmem="${results_dir}/${prefix}_ps_memory_${dt}.csv"
+    local txn="${results_dir}/${prefix}_txn_counters_${dt}.csv"
 
     echo "# MySQL /proc/${pid}/smaps_rollup data collection" > "${rollup}"
     echo "# MySQL /proc/${pid}/maps data collection" > "${maps}"
@@ -545,6 +550,9 @@ run_collectors() {
     { echo "# mysqld memory log (every 5 seconds), PID ${pid}"
       echo "# Timestamp, VmRSS_KB, VmSize_KB"; } > "${rss}"
     echo "timestamp,tracked_bytes" > "${psmem}"
+    # Cumulative counters; the report turns deltas into TPM over time
+    # (HammerDB's "MySQL TPM" = Com_commit + Com_rollback per minute)
+    echo "timestamp,com_commit,com_rollback,questions" > "${txn}"
 
     local iteration=0 ts
     while kill -0 ${pid} 2>/dev/null && [ -f "${run_flag}" ]; do
@@ -566,6 +574,15 @@ run_collectors() {
                 "SELECT CONCAT('${ts}', ',', COALESCE(SUM(CURRENT_NUMBER_OF_BYTES_USED),0)) \
                  FROM performance_schema.memory_summary_global_by_event_name" \
                  >> "${psmem}" 2>/dev/null || true
+
+            "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -N -B -e \
+                "SELECT CONCAT('${ts}', ',', \
+                    MAX(CASE WHEN VARIABLE_NAME='Com_commit' THEN VARIABLE_VALUE END), ',', \
+                    MAX(CASE WHEN VARIABLE_NAME='Com_rollback' THEN VARIABLE_VALUE END), ',', \
+                    MAX(CASE WHEN VARIABLE_NAME='Questions' THEN VARIABLE_VALUE END)) \
+                 FROM performance_schema.global_status \
+                 WHERE VARIABLE_NAME IN ('Com_commit','Com_rollback','Questions')" \
+                 >> "${txn}" 2>/dev/null || true
         fi
 
         if [ $((iteration % 12)) -eq 0 ]; then
@@ -786,26 +803,34 @@ run_one() {
     echo "steady,${phase_start},${phase_end}" >> "${phases_csv}"
     log_info "Phase 'steady' complete"
 
-    # --- Phase 2: idle (release-to-OS behavior) ----------------------------
-    phase_start=$(date +"%Y-%m-%d %H:%M:%S")
-    log_info "Phase 'idle': no load for ${IDLE_MINUTES} minutes (RSS decay)"
-    sleep $((IDLE_MINUTES * 60))
-    phase_end=$(date +"%Y-%m-%d %H:%M:%S")
-    echo "idle,${phase_start},${phase_end}" >> "${phases_csv}"
-    log_info "Phase 'idle' complete"
+    # --- Phase 2: idle (release-to-OS behavior; skipped when 0) ------------
+    if [ "${IDLE_MINUTES}" -gt 0 ]; then
+        phase_start=$(date +"%Y-%m-%d %H:%M:%S")
+        log_info "Phase 'idle': no load for ${IDLE_MINUTES} minutes (RSS decay)"
+        sleep $((IDLE_MINUTES * 60))
+        phase_end=$(date +"%Y-%m-%d %H:%M:%S")
+        echo "idle,${phase_start},${phase_end}" >> "${phases_csv}"
+        log_info "Phase 'idle' complete"
+    else
+        log_info "Phase 'idle' skipped (--idle-minutes=0)"
+    fi
 
-    # --- Phase 3: regrow (fragmentation ratchet) ---------------------------
-    phase_start=$(date +"%Y-%m-%d %H:%M:%S")
-    run_hammerdb_phase "regrow" "${REGROW_MINUTES}" "${RAMPUP_MINUTES}" \
-        "${results_dir}/${prefix}_hammerdb_regrow_${dt}.log"
-    sleep 30
-    start_stress_clients "${results_dir}/${prefix}_stress_regrow_${dt}"
-    wait ${HAMMERDB_PID} 2>/dev/null
-    HAMMERDB_PID=""
-    stop_stress_clients
-    phase_end=$(date +"%Y-%m-%d %H:%M:%S")
-    echo "regrow,${phase_start},${phase_end}" >> "${phases_csv}"
-    log_info "Phase 'regrow' complete"
+    # --- Phase 3: regrow (fragmentation ratchet; skipped when 0) -----------
+    if [ "${REGROW_MINUTES}" -gt 0 ]; then
+        phase_start=$(date +"%Y-%m-%d %H:%M:%S")
+        run_hammerdb_phase "regrow" "${REGROW_MINUTES}" "${RAMPUP_MINUTES}" \
+            "${results_dir}/${prefix}_hammerdb_regrow_${dt}.log"
+        sleep 30
+        start_stress_clients "${results_dir}/${prefix}_stress_regrow_${dt}"
+        wait ${HAMMERDB_PID} 2>/dev/null
+        HAMMERDB_PID=""
+        stop_stress_clients
+        phase_end=$(date +"%Y-%m-%d %H:%M:%S")
+        echo "regrow,${phase_start},${phase_end}" >> "${phases_csv}"
+        log_info "Phase 'regrow' complete"
+    else
+        log_info "Phase 'regrow' skipped (--regrow-minutes=0)"
+    fi
 
     # Stop collectors, shut down mysqld
     rm -f "${run_flag}"

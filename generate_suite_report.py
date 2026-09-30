@@ -94,6 +94,23 @@ def parse_run(run):
                 if len(parts) == 2 and parts[1].isdigit():
                     tracked.append((ts(parts[0]), int(parts[1])))
 
+    # TPM over time from cumulative Com_commit + Com_rollback counters
+    # (same definition HammerDB uses for "MySQL TPM")
+    tpm_series = []
+    tc = one(d, f'{prefix}_txn_counters_*.csv')
+    if tc:
+        counters = []
+        with open(tc) as f:
+            next(f, None)
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) == 4 and parts[1].isdigit() and parts[2].isdigit():
+                    counters.append((ts(parts[0]), int(parts[1]) + int(parts[2])))
+        for (t1, c1), (t2, c2) in zip(counters, counters[1:]):
+            mins = (t2 - t1).total_seconds() / 60.0
+            if mins > 0 and c2 >= c1:
+                tpm_series.append((t2, (c2 - c1) / mins))
+
     # VMA count per snapshot from the maps log
     vma = []
     mf = one(d, f'{prefix}_mysql_maps_*.log')
@@ -187,6 +204,7 @@ def parse_run(run):
         'ratchet_kb': ratchet,
         'max_ahp_kb': max((v for _, v in ahp), default=0),
         'series': {
+            'tpm': grid(tpm_series),
             'rss': rss_grid,                     # KB
             'overhead': overhead_grid,           # KB
             'vma': grid(vma),
@@ -222,6 +240,13 @@ ALLOCATOR_COLORS = {
 FALLBACK_COLORS = ['#e87ba4', '#008300', '#4a3aa7', '#e34948']
 
 LINE_CHARTS = [
+    ('tpm', 'MySQL TPM over time (mean across reps)', 'TPM', 1,
+     'Com_commit + Com_rollback per minute (the counters behind HammerDB\'s '
+     '"MySQL TPM"), sampled every 30 s. Shows rampup, steady plateau, the '
+     'idle gap and the regrow plateau; a lower second plateau indicates '
+     'work the idle phase left behind (data growth, purge backlog). '
+     'Requires the txn-counter log; runs from older suite versions are '
+     'not shown here.'),
     ('rss', 'RSS over time (mean across reps)', 'GB', 1 / 1024 / 1024,
      'mysqld resident memory through the steady → idle → regrow phases. '
      'Idle phase is shaded; a drop there is memory the allocator returned '
@@ -316,8 +341,11 @@ def build_report(runs_parsed, output_file, suite_dir):
         idle_shade = [round(sum(b[0] for b in idle_bounds) / len(idle_bounds), 1),
                       round(sum(b[1] for b in idle_bounds) / len(idle_bounds), 1)]
 
+    # Omit time-series charts for which no run has data (e.g. TPM over time
+    # for results collected before the txn-counter log existed)
+    have_data = {k for c in combo_list for k, pts in c['series'].items() if pts}
     line_meta = [{'key': k, 'title': t, 'unit': u, 'scale': sc, 'desc': d}
-                 for k, t, u, sc, d in LINE_CHARTS]
+                 for k, t, u, sc, d in LINE_CHARTS if k in have_data]
     bar_meta = [{'key': k, 'title': t, 'unit': u, 'desc': d}
                 for k, t, u, d in BAR_CHARTS]
 
