@@ -575,14 +575,14 @@ run_collectors() {
                  FROM performance_schema.memory_summary_global_by_event_name" \
                  >> "${psmem}" 2>/dev/null || true
 
+            # Com_% counters are absent from performance_schema.global_status
+            # (session-aggregated); SHOW GLOBAL STATUS is the reliable source
             "${MYSQL_CLIENT}" --socket="${MYSQL_SOCKET}" -u root -N -B -e \
-                "SELECT CONCAT('${ts}', ',', \
-                    MAX(CASE WHEN VARIABLE_NAME='Com_commit' THEN VARIABLE_VALUE END), ',', \
-                    MAX(CASE WHEN VARIABLE_NAME='Com_rollback' THEN VARIABLE_VALUE END), ',', \
-                    MAX(CASE WHEN VARIABLE_NAME='Questions' THEN VARIABLE_VALUE END)) \
-                 FROM performance_schema.global_status \
-                 WHERE VARIABLE_NAME IN ('Com_commit','Com_rollback','Questions')" \
-                 >> "${txn}" 2>/dev/null || true
+                "SHOW GLOBAL STATUS WHERE Variable_name IN \
+                 ('Com_commit','Com_rollback','Questions')" 2>/dev/null | \
+                awk -v ts="${ts}" '$1=="Com_commit"{c=$2} $1=="Com_rollback"{r=$2} \
+                    $1=="Questions"{q=$2} END{if(c!=""&&q!="") print ts","c","r","q}' \
+                >> "${txn}" || true
         fi
 
         if [ $((iteration % 12)) -eq 0 ]; then
