@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory allocator benchmark — RocksDB (MyRocks engine) · glibc vs jemalloc vs tcmalloc</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --glibc: #2a78d6;    /* categorical slot 1 — blue */
+    --jemalloc: #eb6834; /* categorical slot 2 — orange */
+    --tcmalloc: #1baf7a; /* categorical slot 3 — aqua */
+    --good-text: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --glibc: #3987e5;
+      --jemalloc: #d95926;
+      --tcmalloc: #199e70;
+      --good-text: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --glibc: #3987e5;
+    --jemalloc: #d95926;
+    --tcmalloc: #199e70;
+    --good-text: #0ca30c;
+  }
+
+  * { box-sizing: border-box; }
+  body.viz-root {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 24px 64px; }
+  header.report h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header.report p.sub { color: var(--text-secondary); margin: 0 0 4px; }
+  header.report p.meta { color: var(--text-muted); font-size: 13px; margin: 0; }
+  .theme-toggle {
+    float: right; margin-top: 4px;
+    background: var(--surface-1); color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  section { margin-top: 40px; }
+  h2 { font-size: 19px; margin: 0 0 4px; }
+  h2 + p.lede { color: var(--text-secondary); margin: 0 0 16px; max-width: 72ch; }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 20px; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px;
+  }
+  .tile .label { font-size: 13px; color: var(--text-secondary); }
+  .tile .value { font-size: 30px; font-weight: 600; margin-top: 2px; }
+  .tile .hero  { font-size: 48px; font-weight: 600; line-height: 1.1; }
+  .tile .note  { font-size: 12.5px; color: var(--text-muted); margin-top: 4px; }
+  .tile .up-good { color: var(--good-text); font-weight: 600; }
+
+  figure.chart {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; margin: 16px 0 0; padding: 18px 20px 14px;
+  }
+  figure.chart figcaption { margin-bottom: 2px; }
+  figure.chart figcaption .t { font-weight: 600; font-size: 15px; }
+  figure.chart figcaption .s { color: var(--text-muted); font-size: 12.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 2px; font-size: 13px; color: var(--text-secondary); }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  svg { display: block; width: 100%; height: auto; }
+  svg text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .axis-label { fill: var(--text-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .cat-label  { fill: var(--text-secondary); font-size: 12.5px; }
+  .val-label  { fill: var(--text-primary); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .gridline   { stroke: var(--grid); stroke-width: 1; }
+  .baseline   { stroke: var(--baseline); stroke-width: 1; }
+  .bar { transition: filter .1s; outline: none; }
+  .bar:hover rect.fill, .bar:focus-visible rect.fill { filter: brightness(1.12); }
+  .bar:focus-visible rect.fill { stroke: var(--text-primary); stroke-width: 1; }
+
+  .multiples { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; margin-top: 16px; }
+  .multiples figure.chart { margin: 0; }
+
+  .tooltip {
+    position: fixed; z-index: 10; pointer-events: none;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 11px; font-size: 13px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18); max-width: 280px; display: none;
+  }
+  .tooltip .tv { font-weight: 600; font-size: 14px; }
+  .tooltip .tl { color: var(--text-secondary); display: inline-flex; align-items: center; gap: 6px; }
+  .tooltip .lk { display: inline-block; width: 12px; height: 3px; border-radius: 2px; }
+
+  details.tableview { margin-top: 10px; }
+  details.tableview summary { cursor: pointer; font-size: 13px; color: var(--text-secondary); user-select: none; }
+  table.data { border-collapse: collapse; margin-top: 8px; font-size: 13px; width: 100%; }
+  table.data th, table.data td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  table.data th:first-child, table.data td:first-child { text-align: left; font-variant-numeric: normal; }
+  table.data th { color: var(--text-secondary); font-weight: 600; }
+
+  .note-card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 18px; margin-top: 16px;
+    font-size: 14px; color: var(--text-secondary); max-width: 100%;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+  dl.env { display: grid; grid-template-columns: 220px 1fr; gap: 4px 16px; margin: 12px 0 0; font-size: 14px; }
+  dl.env dt { color: var(--text-muted); }
+  dl.env dd { margin: 0; color: var(--text-secondary); }
+  footer { margin-top: 48px; color: var(--text-muted); font-size: 12.5px; }
+</style>
+</head>
+<body class="viz-root">
+<div class="wrap">
+
+<header class="report">
+  <button class="theme-toggle" id="themeToggle" type="button">Toggle dark mode</button>
+  <h1>Memory allocator benchmark: RocksDB under glibc, jemalloc, tcmalloc</h1>
+  <p class="sub">RocksDB <span class="mono">db_bench</span> (the storage engine behind MyRocks), driven by mimalloc-bench, swapping the allocator via <span class="mono">LD_PRELOAD</span>.</p>
+  <p class="meta">Run on October 1, 2026 · 80-core Intel Xeon Gold 6230 @ 2.10 GHz · 187 GB RAM · Ubuntu 24.04 LTS, Linux 6.8.0-60</p>
+</header>
+
+<section id="headline">
+  <div class="kpis">
+    <div class="tile">
+      <div class="label">Random-read speedup, tcmalloc vs glibc (80 threads)</div>
+      <div class="hero">2.6×</div>
+      <div class="note">2,862,622 vs 1,090,996 ops/sec in readrandom</div>
+    </div>
+    <div class="tile">
+      <div class="label">Peak memory, tcmalloc vs glibc</div>
+      <div class="value"><span class="up-good">−38%</span></div>
+      <div class="note">345 MB vs 556 MB peak RSS over the 3-phase run</div>
+    </div>
+    <div class="tile">
+      <div class="label">Total wall time, tcmalloc vs glibc</div>
+      <div class="value"><span class="up-good">−14%</span></div>
+      <div class="note">4:42 vs 5:29 for fillrandom + readrandom + overwrite</div>
+    </div>
+    <div class="tile">
+      <div class="label">Write throughput spread across allocators</div>
+      <div class="value">&lt; 1%</div>
+      <div class="note">Writes are bottlenecked by RocksDB’s write path, not malloc</div>
+    </div>
+  </div>
+</section>
+
+<section id="phase-throughput">
+  <h2>Throughput by phase — 80 threads</h2>
+  <p class="lede">Each phase runs 80 threads × 1,000,000 operations (80M ops total) over a 1M-key space.
+  Writes are identical across allocators; the random-read phase, which is CPU- and allocation-bound once the
+  dataset is cached, separates them sharply.</p>
+  <div id="chart-phases"></div>
+</section>
+
+<section id="resources">
+  <h2>Resource usage — 80-thread run (all three phases)</h2>
+  <p class="lede">Totals for the whole <span class="mono">fillrandom,readrandom,overwrite</span> sequence per allocator,
+  as recorded by mimalloc-bench. Lower is better in every panel.</p>
+  <div class="multiples" id="chart-resources"></div>
+</section>
+
+<section id="single-thread">
+  <h2>Single-threaded baseline — 1 thread, 1M operations</h2>
+  <p class="lede">The suite’s default <span class="mono">fillrandom</span> run (4 runs per allocator; bars show the mean,
+  the table has every run). At one thread there is no lock contention to win, so the allocators sit within
+  ~4% of each other — the contrast with the 80-thread read numbers is the finding.</p>
+  <div class="multiples" id="chart-single"></div>
+</section>
+
+<section id="aborted">
+  <h2>Footnote: the 10M-key attempt</h2>
+  <div class="note-card">
+    A heavier configuration (<span class="mono">--threads=80 --num=10000000</span>, i.e. 800M ops per phase) was started
+    first but exceeded the 2-hour execution window with only glibc partially done, so it is not comparative and is not
+    charted. The glibc numbers it produced before being stopped: <strong>fillrandom 199,295 ops/sec</strong>
+    (4,014 s, 22.0 MB/s) and <strong>readrandom 2,256,908 ops/sec</strong> (354 s, 249.7 MB/s); overwrite was interrupted
+    at ~71%. Note the much lower write throughput at 10M keys — more compaction work — while random reads remained fast.
+  </div>
+</section>
+
+<section id="method">
+  <h2>Methodology &amp; environment</h2>
+  <dl class="env">
+    <dt>Benchmark</dt><dd>RocksDB 10.10.1 <span class="mono">db_bench</span>, built with jemalloc/tcmalloc linkage disabled so <span class="mono">LD_PRELOAD</span> controls the allocator</dd>
+    <dt>Harness</dt><dd>mimalloc-bench <span class="mono">bench.sh sys je tc rocksdb</span>; timing/RSS via GNU time</dd>
+    <dt>80-thread workload</dt><dd><span class="mono">db_bench --threads=80 --benchmarks=fillrandom,readrandom,overwrite --num=1000000</span></dd>
+    <dt>Single-thread workload</dt><dd><span class="mono">db_bench --benchmarks=fillrandom</span> (1M ops, suite default), 4 runs per allocator</dd>
+    <dt>glibc (sys)</dt><dd>2.39 (Ubuntu 24.04 system allocator, ptmalloc2)</dd>
+    <dt>jemalloc (je)</dt><dd>5.4.0, commit <span class="mono">7a34f185</span>, preloaded <span class="mono">libjemalloc.so</span></dd>
+    <dt>tcmalloc (tc)</dt><dd>gperftools 2.18, commit <span class="mono">6ed7350</span>, preloaded <span class="mono">libtcmalloc_minimal.so</span></dd>
+    <dt>Hardware</dt><dd>2× sockets, 80 logical CPUs (Xeon Gold 6230 @ 2.10 GHz, 27.5 MB L3), 187 GB RAM</dd>
+    <dt>OS</dt><dd>Ubuntu 24.04 LTS, kernel 6.8.0-60-generic</dd>
+    <dt>Caveats</dt><dd>One run per configuration for the 80-thread workload; single-thread repeats varied ≤ 1.2%, suggesting stable conditions. Database on <span class="mono">/tmp</span> (same disk for all runs).</dd>
+  </dl>
+</section>
+
+<footer>Generated with mimalloc-bench · RocksDB db_bench · October 1, 2026</footer>
+</div>
+
+<div class="tooltip" id="tooltip" role="status"></div>
+
+<script>
+"use strict";
+
+const ALLOC = [
+  { id: "sys", name: "glibc 2.39",        cssVar: "--glibc" },
+  { id: "je",  name: "jemalloc 5.4.0",    cssVar: "--jemalloc" },
+  { id: "tc",  name: "tcmalloc 2.18",     cssVar: "--tcmalloc" },
+];
+
+/* ---------- data ---------- */
+
+const phases80 = [
+  { phase: "fillrandom", unit: "ops/sec", vals: { sys: 629626, je: 625677, tc: 631390 },
+    extra: { sys: "69.7 MB/s · 126.95 µs/op", je: "69.2 MB/s · 127.77 µs/op", tc: "69.8 MB/s · 126.62 µs/op" } },
+  { phase: "readrandom", unit: "ops/sec", vals: { sys: 1090996, je: 1654179, tc: 2862622 },
+    extra: { sys: "120.7 MB/s · 68.07 µs/op", je: "183.0 MB/s · 45.43 µs/op", tc: "316.7 MB/s · 26.90 µs/op" } },
+  { phase: "overwrite",  unit: "ops/sec", vals: { sys: 625312, je: 628654, tc: 630282 },
+    extra: { sys: "69.2 MB/s · 127.86 µs/op", je: "69.5 MB/s · 127.14 µs/op", tc: "69.7 MB/s · 126.84 µs/op" } },
+];
+
+const resources80 = [
+  { title: "Wall time", unit: "seconds", fmt: v => fmtTime(v), vals: { sys: 328.86, je: 304.17, tc: 282.15 } },
+  { title: "Peak RSS", unit: "MB", fmt: v => Math.round(v).toLocaleString() + " MB", vals: { sys: 556.1, je: 645.9, tc: 345.1 } },
+  { title: "User CPU time", unit: "seconds", fmt: v => Math.round(v).toLocaleString() + " s", vals: { sys: 10144.7, je: 8406.8, tc: 6976.2 } },
+  { title: "System CPU time", unit: "seconds", fmt: v => Math.round(v).toLocaleString() + " s", vals: { sys: 4223.5, je: 4012.2, tc: 3965.7 } },
+  { title: "Page reclaims (soft faults)", unit: "count", fmt: v => (v/1e6).toFixed(2) + "M", vals: { sys: 1834279, je: 1654185, tc: 1238634 } },
+];
+
+/* single-thread: 4 runs each */
+const singleRuns = {
+  sys: { wall: [9.37, 9.57, 9.50, 9.46], rssKB: [93440, 93440, 93440, 93440],   reclaims: [66654, 66419, 66052, 66586], ops: [107076, 106222] },
+  je:  { wall: [9.18, 9.24, 9.22, 9.22], rssKB: [103048, 103312, 101772, 101764], reclaims: [53764, 53386, 53612, 53357], ops: [109521, 108947] },
+  tc:  { wall: [8.98, 9.09, 9.08, 9.08], rssKB: [101120, 101120, 101120, 99840],  reclaims: [59119, 58696, 58868, 59016], ops: [112086, 110739] },
+};
+const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+
+const singlePanels = [
+  { title: "fillrandom throughput", unit: "ops/sec", fmt: v => Math.round(v).toLocaleString() + " ops/s",
+    note: "mean of 2 recorded samples", vals: Object.fromEntries(ALLOC.map(a => [a.id, mean(singleRuns[a.id].ops)])) },
+  { title: "Wall time", unit: "seconds", fmt: v => v.toFixed(2) + " s",
+    note: "mean of 4 runs", vals: Object.fromEntries(ALLOC.map(a => [a.id, mean(singleRuns[a.id].wall)])) },
+  { title: "Peak RSS", unit: "MB", fmt: v => v.toFixed(1) + " MB",
+    note: "mean of 4 runs", vals: Object.fromEntries(ALLOC.map(a => [a.id, mean(singleRuns[a.id].rssKB) / 1024])) },
+  { title: "Page reclaims", unit: "count", fmt: v => Math.round(v).toLocaleString(),
+    note: "mean of 4 runs", vals: Object.fromEntries(ALLOC.map(a => [a.id, mean(singleRuns[a.id].reclaims)])) },
+];
+
+/* ---------- helpers ---------- */
+
+function fmtTime(sec) {
+  const m = Math.floor(sec / 60), s = sec - m * 60;
+  return m + ":" + (s < 10 ? "0" : "") + s.toFixed(0);
+}
+function fmtOps(v) {
+  return v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : Math.round(v / 1000).toLocaleString() + "K";
+}
+function niceTicks(max, n) {
+  const raw = max / n, pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * pow).find(s => max / s <= n) || 10 * pow;
+  const ticks = [];
+  for (let v = 0; v <= max * 1.0001; v += step) ticks.push(v);
+  return ticks;
+}
+function color(cssVar) { return `var(${cssVar})`; }
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(name, attrs, parent) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+/* tooltip */
+const tip = document.getElementById("tooltip");
+function showTip(evt, valueText, seriesName, cssVar, extraText) {
+  tip.textContent = "";
+  const v = document.createElement("div"); v.className = "tv"; v.textContent = valueText; tip.appendChild(v);
+  const l = document.createElement("div"); l.className = "tl";
+  const key = document.createElement("span"); key.className = "lk";
+  key.style.background = color(cssVar); l.appendChild(key);
+  l.appendChild(document.createTextNode(seriesName)); tip.appendChild(l);
+  if (extraText) { const x = document.createElement("div"); x.className = "tl"; x.textContent = extraText; tip.appendChild(x); }
+  tip.style.display = "block";
+  const pad = 14, r = tip.getBoundingClientRect();
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + r.width > window.innerWidth - 8) x = evt.clientX - r.width - pad;
+  if (y + r.height > window.innerHeight - 8) y = evt.clientY - r.height - pad;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+
+function legendHTML() {
+  const wrap = document.createElement("div");
+  wrap.className = "legend";
+  for (const a of ALLOC) {
+    const k = document.createElement("span"); k.className = "key";
+    const sw = document.createElement("span"); sw.className = "swatch";
+    sw.style.background = color(a.cssVar); k.appendChild(sw);
+    k.appendChild(document.createTextNode(a.name)); wrap.appendChild(k);
+  }
+  return wrap;
+}
+
+/* generic horizontal bar chart.
+   groups: [{label, sublabel?, bars: [{alloc, value, valueLabel, extra?}]}] */
+function hbarChart(mount, opts) {
+  const { title, subtitle, groups, maxValue, tickFmt, showLegend = true, tableRows, tableHead, compact = false } = opts;
+  const fig = document.createElement("figure"); fig.className = "chart";
+  const cap = document.createElement("figcaption");
+  const t = document.createElement("div"); t.className = "t"; t.textContent = title; cap.appendChild(t);
+  if (subtitle) { const s = document.createElement("div"); s.className = "s"; s.textContent = subtitle; cap.appendChild(s); }
+  fig.appendChild(cap);
+  if (showLegend) fig.appendChild(legendHTML());
+
+  const hasCatLabels = groups.some(g => g.label);
+  const labelW = hasCatLabels ? 86 : 12;
+  const valueW = compact ? 108 : 86;
+  const barH = compact ? 16 : 18;
+  const barGap = 2, groupPad = 14, topPad = 6, axisBand = 22;
+  const width = compact ? 480 : 920;
+  const plotW = width - labelW - valueW;
+  const groupH = groups[0].bars.length * (barH + barGap) - barGap;
+  const height = topPad + groups.length * (groupH + groupPad) - groupPad + 10 + axisBand;
+  const svg = el("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": title });
+
+  const max = maxValue || Math.max(...groups.flatMap(g => g.bars.map(b => b.value))) * 1.08;
+  const x = v => labelW + (v / max) * plotW;
+
+  const ticks = niceTicks(max, 5);
+  for (const tv of ticks) {
+    el("line", { x1: x(tv), x2: x(tv), y1: topPad, y2: height - axisBand, class: "gridline" }, svg);
+    const txt = el("text", { x: x(tv), y: height - axisBand + 15, "text-anchor": "middle", class: "axis-label" }, svg);
+    txt.textContent = tickFmt(tv);
+  }
+  el("line", { x1: labelW, x2: labelW, y1: topPad, y2: height - axisBand, class: "baseline" }, svg);
+
+  let y = topPad;
+  for (const g of groups) {
+    const cat = el("text", { x: labelW - 10, y: y + groupH / 2 + 4, "text-anchor": "end", class: "cat-label" }, svg);
+    cat.textContent = g.label;
+    let by = y;
+    for (const b of g.bars) {
+      const a = ALLOC.find(al => al.id === b.alloc);
+      const w = Math.max(x(b.value) - labelW, 2);
+      const grp = el("g", { class: "bar", tabindex: "0", role: "img",
+        "aria-label": `${g.label}, ${a.name}: ${b.valueLabel}` }, svg);
+      const r = 4;
+      /* rounded data-end (right), square at baseline (left) */
+      el("path", { d: `M ${labelW} ${by} H ${labelW + w - r} Q ${labelW + w} ${by} ${labelW + w} ${by + r}
+                        V ${by + barH - r} Q ${labelW + w} ${by + barH} ${labelW + w - r} ${by + barH}
+                        H ${labelW} Z`,
+        fill: color(a.cssVar), class: "fill" }, grp);
+      /* invisible full-width hit target so hover never requires pinpoint aim */
+      const hit = el("rect", { x: labelW, y: by - barGap / 2, width: plotW, height: barH + barGap, fill: "transparent" }, grp);
+      const vl = el("text", { x: labelW + w + 8, y: by + barH / 2 + 4.5, class: "val-label" }, svg);
+      vl.textContent = b.valueLabel;
+      const onMove = evt => showTip(evt, b.valueLabel, `${a.name} — ${g.label}`, a.cssVar, b.extra);
+      hit.addEventListener("pointermove", onMove);
+      hit.addEventListener("pointerleave", hideTip);
+      grp.addEventListener("focus", evt => {
+        const r2 = grp.getBoundingClientRect();
+        showTip({ clientX: r2.left + r2.width / 2, clientY: r2.top }, b.valueLabel, `${a.name} — ${g.label}`, a.cssVar, b.extra);
+      });
+      grp.addEventListener("blur", hideTip);
+      by += barH + barGap;
+    }
+    y += groupH + groupPad;
+  }
+  fig.appendChild(svg);
+
+  if (tableRows) {
+    const det = document.createElement("details"); det.className = "tableview";
+    const sum = document.createElement("summary"); sum.textContent = "View as table"; det.appendChild(sum);
+    const table = document.createElement("table"); table.className = "data";
+    const thr = document.createElement("tr");
+    for (const h of tableHead) { const th = document.createElement("th"); th.textContent = h; thr.appendChild(th); }
+    table.appendChild(thr);
+    for (const row of tableRows) {
+      const tr = document.createElement("tr");
+      for (const c of row) { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); }
+      table.appendChild(tr);
+    }
+    det.appendChild(table);
+    fig.appendChild(det);
+  }
+  mount.appendChild(fig);
+  return fig;
+}
+
+/* ---------- chart 1: per-phase throughput ---------- */
+{
+  const groups = phases80.map(p => ({
+    label: p.phase,
+    bars: ALLOC.map(a => ({
+      alloc: a.id, value: p.vals[a.id],
+      valueLabel: fmtOps(p.vals[a.id]) + " ops/s",
+      extra: p.extra[a.id],
+    })),
+  }));
+  hbarChart(document.getElementById("chart-phases"), {
+    title: "Aggregate throughput per phase (higher is better)",
+    subtitle: "db_bench --threads=80 --num=1000000 · one run per allocator",
+    groups,
+    tickFmt: v => v === 0 ? "0" : fmtOps(v),
+    tableHead: ["Phase", "glibc (ops/s)", "jemalloc (ops/s)", "tcmalloc (ops/s)"],
+    tableRows: phases80.map(p => [p.phase, ...ALLOC.map(a => p.vals[a.id].toLocaleString())]),
+  });
+}
+
+/* ---------- chart 2: resources, small multiples ---------- */
+{
+  const mountAll = document.getElementById("chart-resources");
+  for (const m of resources80) {
+    hbarChart(mountAll, {
+      title: m.title,
+      subtitle: "lower is better",
+      showLegend: true,
+      compact: true,
+      groups: [{
+        label: "",
+        bars: ALLOC.map(a => ({
+          alloc: a.id, value: m.vals[a.id], valueLabel: m.fmt(m.vals[a.id]),
+        })),
+      }],
+      tickFmt: v => m.unit === "count" ? (v === 0 ? "0" : (v / 1e6).toFixed(1) + "M")
+               : m.unit === "MB" ? Math.round(v).toLocaleString()
+               : Math.round(v).toLocaleString(),
+      tableHead: ["Allocator", m.title + (m.unit !== "count" ? " (" + m.unit + ")" : "")],
+      tableRows: ALLOC.map(a => [a.name, m.vals[a.id].toLocaleString()]),
+    });
+  }
+}
+
+/* ---------- chart 3: single-thread panels ---------- */
+{
+  const mountAll = document.getElementById("chart-single");
+  for (const m of singlePanels) {
+    const lowBetter = m.title !== "fillrandom throughput";
+    hbarChart(mountAll, {
+      title: m.title,
+      subtitle: (lowBetter ? "lower is better · " : "higher is better · ") + m.note,
+      compact: true,
+      groups: [{
+        label: "",
+        bars: ALLOC.map(a => ({ alloc: a.id, value: m.vals[a.id], valueLabel: m.fmt(m.vals[a.id]) })),
+      }],
+      tickFmt: v => m.unit === "ops/sec" ? (v === 0 ? "0" : fmtOps(v))
+               : m.unit === "seconds" ? v.toFixed(1)
+               : Math.round(v).toLocaleString(),
+      tableHead: ["Allocator", m.title],
+      tableRows: ALLOC.map(a => [a.name, m.fmt(m.vals[a.id])]),
+    });
+  }
+
+  /* full per-run table */
+  const det = document.createElement("details"); det.className = "tableview";
+  const sum = document.createElement("summary"); sum.textContent = "View every single-thread run"; det.appendChild(sum);
+  const table = document.createElement("table"); table.className = "data";
+  const head = ["Allocator", "Run", "Wall (s)", "Peak RSS (KB)", "Page reclaims"];
+  const thr = document.createElement("tr");
+  for (const h of head) { const th = document.createElement("th"); th.textContent = h; thr.appendChild(th); }
+  table.appendChild(thr);
+  for (const a of ALLOC) {
+    const r = singleRuns[a.id];
+    r.wall.forEach((w, i) => {
+      const tr = document.createElement("tr");
+      [a.name, "run " + (i + 1), w.toFixed(2), r.rssKB[i].toLocaleString(), r.reclaims[i].toLocaleString()]
+        .forEach(c => { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); });
+      table.appendChild(tr);
+    });
+  }
+  det.appendChild(table);
+  mountAll.parentElement.appendChild(det);
+}
+
+/* ---------- theme toggle ---------- */
+document.getElementById("themeToggle").addEventListener("click", () => {
+  const root = document.documentElement;
+  const cur = root.getAttribute("data-theme");
+  const osDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const effectiveDark = cur === "dark" || (cur !== "light" && osDark);
+  root.setAttribute("data-theme", effectiveDark ? "light" : "dark");
+});
+</script>
+</body>
+</html>
