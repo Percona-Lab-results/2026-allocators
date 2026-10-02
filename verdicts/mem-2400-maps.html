@@ -1,0 +1,23 @@
+<p><strong>Setup:</strong> 20-hour HammerDB TPC-C runs at ~2400&nbsp;MHz with a 150&nbsp;GB buffer
+pool, /proc/pid/maps sampled every few seconds (~21k snapshots per run).</p>
+<ul>
+<li><strong>glibc is the address-space outlier:</strong> a constant 5.95&nbsp;GB of PROT_NONE
+reserved arena space (all other allocators ~0), the most VMAs (~2,040), nearly double the mapping
+churn of tcmalloc, and the lowest committed-to-mapped efficiency (96.5&nbsp;% vs 99.9&nbsp;%).</li>
+<li><strong>jemalloc&nbsp;5.3 is the leanest on mappings</strong> (~1,333 VMAs, lowest churn) but
+keeps the largest committed virtual footprint (~170&nbsp;GB, of which ~7&nbsp;GB is not resident
+&mdash; decay purging returns pages while keeping ranges mapped; cosmetic for VSZ-based
+monitoring).</li>
+<li><strong>tcmalloc has the tightest virtual/physical correspondence</strong> (committed &asymp;
+resident, no reserves, lowest churn).</li>
+<li><strong>All configurations are flat over 20 hours</strong> &mdash; committed growth
+&le;0.06&nbsp;GB; no maps-level leak or creep at this load.</li>
+<li><strong>The THP axis of this dataset is void:</strong> AnonHugePages is 0&nbsp;kB in every
+snapshot of every run &mdash; THP was in <code>madvise</code> mode and never engaged, so the
+thp/nothp pairs are effectively duplicate runs (usefully, they calibrate the noise floor:
+identical configurations differ by 0.2&ndash;1.3&nbsp;% NOPM). Later suites fixed this by setting
+THP via sysfs and verifying AnonHugePages in-run.</li>
+</ul>
+<p><strong>Bottom line:</strong> under a huge stable buffer pool no allocator misbehaves on RSS,
+but glibc is the worst address-space citizen; the differences here are virtual-memory hygiene, not
+physical footprint (see the smaps report for residency).</p>

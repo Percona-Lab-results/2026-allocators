@@ -35,6 +35,19 @@ def ts(s):
     return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
 
 
+def load_verdict(path):
+    """Wrap a verdict HTML fragment for injection into the report."""
+    if not path:
+        return ''
+    with open(path) as f:
+        content = f.read()
+    return ('<div class="verdict" style="background-color:#f0f7ee;'
+            'border-left:4px solid #0ca30c;padding:15px 20px;margin:20px 0;'
+            'font-size:14px;line-height:1.5;">\n'
+            '<h2 style="margin-top:0;">Verdict</h2>\n'
+            + content + '\n</div>')
+
+
 def find_run_dirs(suite_dir):
     """Find run directories at any depth up to 2 below suite_dir."""
     # Optional trailing storage-engine token (e.g. -48G-myrocks)
@@ -53,17 +66,28 @@ def find_run_dirs(suite_dir):
 
 
 def one(dirpath, pattern):
-    files = glob.glob(os.path.join(dirpath, pattern))
+    files = sorted(glob.glob(os.path.join(dirpath, pattern)))
     return files[0] if files else None
 
 
-def parse_run(run):
+def run_timestamps(dirpath, prefix):
+    """Timestamps of run instances in a directory (a directory holds more
+    than one when the suite was invoked repeatedly with the same suffix)."""
+    dts = []
+    for f in glob.glob(os.path.join(dirpath, f'{prefix}_phases_*.csv')):
+        m = re.search(r'_phases_(\d{8}_\d{6})\.csv$', f)
+        if m:
+            dts.append(m.group(1))
+    return sorted(dts)
+
+
+def parse_run(run, dt):
     """Parse all per-run files; returns None if the run is unusable."""
     d = run['dir']
     prefix = f"{run['thp']}_{run['allocator']}"
 
-    phases_file = one(d, f'{prefix}_phases_*.csv')
-    rss_file = one(d, f'{prefix}_rss_memory_*.log')
+    phases_file = one(d, f'{prefix}_phases_{dt}.csv')
+    rss_file = one(d, f'{prefix}_rss_memory_{dt}.log')
     if not phases_file or not rss_file:
         return None
 
@@ -85,7 +109,7 @@ def parse_run(run):
     t0 = rss[0][0]
 
     tracked = []
-    pm = one(d, f'{prefix}_ps_memory_*.csv')
+    pm = one(d, f'{prefix}_ps_memory_{dt}.csv')
     if pm:
         with open(pm) as f:
             next(f, None)
@@ -97,7 +121,7 @@ def parse_run(run):
     # TPM over time from cumulative Com_commit + Com_rollback counters
     # (same definition HammerDB uses for "MySQL TPM")
     tpm_series = []
-    tc = one(d, f'{prefix}_txn_counters_*.csv')
+    tc = one(d, f'{prefix}_txn_counters_{dt}.csv')
     if tc:
         counters = []
         with open(tc) as f:
@@ -113,7 +137,7 @@ def parse_run(run):
 
     # VMA count per snapshot from the maps log
     vma = []
-    mf = one(d, f'{prefix}_mysql_maps_*.log')
+    mf = one(d, f'{prefix}_mysql_maps_{dt}.log')
     if mf:
         cur_ts, count = None, 0
         with open(mf, errors='replace') as f:
@@ -131,7 +155,7 @@ def parse_run(run):
 
     # AnonHugePages per snapshot from smaps_rollup
     ahp = []
-    rf = one(d, f'{prefix}_mysql_smaps_rollup_*.log')
+    rf = one(d, f'{prefix}_mysql_smaps_rollup_{dt}.log')
     if rf:
         cur_ts = None
         with open(rf, errors='replace') as f:
@@ -147,7 +171,7 @@ def parse_run(run):
                     cur_ts = None
 
     def final_nopm(phase):
-        f = one(d, f'{prefix}_hammerdb_{phase}_*.log')
+        f = one(d, f'{prefix}_hammerdb_{phase}_{dt}.log')
         if not f:
             return None, None
         m = re.findall(r'achieved (\d+) NOPM from (\d+)',
@@ -265,11 +289,20 @@ LINE_CHARTS = [
      'sit at zero by design).'),
 ]
 
+TPS_CHARTS = [
+    ('tps_range', 'TPS by phase — median and rep range', 'TPS',
+     'Transactions per second (MySQL TPM / 60): allocators side by side '
+     'within each phase (and THP mode) group, drawn as min..max brackets '
+     'with the median tick and its value labeled. The axis is zoomed to '
+     'the data (not zero-based) — these are range marks, and the rep '
+     'spreads are far smaller than the values.'),
+    ('tps_delta', 'TPS relative to the slowest configuration', '%',
+     'Median TPS as % above the slowest configuration/phase in this suite '
+     '(zero-based). This is the honest way to see the differences the '
+     'absolute columns hide: every bar is directly comparable.'),
+]
+
 BAR_CHARTS = [
-    ('tpm_steady', 'TPM — steady phase (median of reps)', 'TPM',
-     'HammerDB MySQL TPM in the first loaded phase.'),
-    ('tpm_regrow', 'TPM — regrow phase (median of reps)', 'TPM',
-     'TPM in the second loaded phase, after the idle period.'),
     ('released', 'RSS released during idle (median of reps)', 'MB',
      'RSS at end of steady minus end of idle: how much memory the allocator '
      'gave back to the OS when load stopped. Higher is better.'),
@@ -279,7 +312,7 @@ BAR_CHARTS = [
 ]
 
 
-def build_report(runs_parsed, output_file, suite_dir):
+def build_report(runs_parsed, output_file, suite_dir, verdict_html=''):
     # Group by combo
     combos = {}
     for r in runs_parsed:
@@ -299,10 +332,11 @@ def build_report(runs_parsed, output_file, suite_dir):
         nopm_steady = med_range([r['nopm']['steady'][0] for r in rs])
         released = med_range([r['released_kb'] for r in rs])
         ratchet = med_range([r['ratchet_kb'] for r in rs])
-        avg_rss = med_range([r['phase_stats'].get('regrow', {}).get('avg_rss_kb')
-                             for r in rs])
-        overhead = med_range([r['phase_stats'].get('regrow', {}).get('avg_overhead_kb')
-                              for r in rs])
+        # Last loaded phase: regrow when present, else steady (steady-only runs)
+        def loaded_phase(r):
+            return r['phase_stats'].get('regrow') or r['phase_stats'].get('steady', {})
+        avg_rss = med_range([loaded_phase(r).get('avg_rss_kb') for r in rs])
+        overhead = med_range([loaded_phase(r).get('avg_overhead_kb') for r in rs])
         max_ahp = med_range([r['max_ahp_kb'] for r in rs])
 
         combo_list.append({
@@ -348,13 +382,15 @@ def build_report(runs_parsed, output_file, suite_dir):
                  for k, t, u, sc, d in LINE_CHARTS if k in have_data]
     bar_meta = [{'key': k, 'title': t, 'unit': u, 'desc': d}
                 for k, t, u, d in BAR_CHARTS]
+    tps_meta = [{'key': k, 'title': t, 'unit': u, 'desc': d}
+                for k, t, u, d in TPS_CHARTS]
 
     sections = []
-    for m in bar_meta[:2]:
+    for m in tps_meta:
         sections.append((m['key'], m['title'], m['desc']))
     for m in line_meta:
         sections.append((m['key'], m['title'], m['desc']))
-    for m in bar_meta[2:]:
+    for m in bar_meta:
         sections.append((m['key'], m['title'], m['desc']))
 
     chart_sections = '\n'.join(
@@ -415,6 +451,8 @@ def build_report(runs_parsed, output_file, suite_dir):
             Bars are the median across repetitions.
         </div>
 
+{verdict_html}
+
 {chart_sections}
 
         <h2>Summary (median across reps; TPM range in parentheses)</h2>
@@ -436,7 +474,11 @@ def build_report(runs_parsed, output_file, suite_dir):
         const combos = {json.dumps(combo_list)};
         const lineMeta = {json.dumps(line_meta)};
         const barMeta = {json.dumps(bar_meta)};
+        const tpsMeta = {json.dumps(tps_meta)};
         const idleShade = {json.dumps(idle_shade)};
+
+        const allocators = [...new Set(combos.map(c => c.allocator))];
+        const thpModes = [...new Set(combos.map(c => c.thp))].sort();
 
         // Shade the idle phase on time-series charts
         const idleBand = {{
@@ -490,9 +532,171 @@ def build_report(runs_parsed, output_file, suite_dir):
             }});
         }});
 
+        // TPS charts: x = phase (x THP mode) groups, allocators side by side
+        // inside each group, colored with the report-wide allocator palette
+        const phaseGroups = [];
+        [['steady', 'tpm_steady'], ['regrow', 'tpm_regrow']].forEach(pk => {{
+            const phase = pk[0], key = pk[1];
+            thpModes.forEach(mode => {{
+                if (combos.some(c => c.thp === mode && c.bars[key])) {{
+                    phaseGroups.push({{ phase, key, mode,
+                        label: thpModes.length > 1
+                            ? phase + ' (' + mode + ')' : phase }});
+                }}
+            }});
+        }});
+        const tpsBar = (a, g) => {{
+            const c = combos.find(x => x.allocator === a && x.thp === g.mode);
+            return (c && c.bars[g.key]) || null;
+        }};
+        const allocColor = a =>
+            (combos.find(c => c.allocator === a) || {{}}).color || '#898781';
+
+        if (document.getElementById('chart_tps_range') && phaseGroups.length) {{
+            // Draw min..max brackets with a median tick + median value label
+            // on top of thin range bars (the bar supplies the group x-offset)
+            const bracketPlugin = {{
+                id: 'bracket',
+                afterDatasetsDraw(chart) {{
+                    const ctx = chart.ctx;
+                    const yS = chart.scales.y;
+                    chart.data.datasets.forEach((ds, di) => {{
+                        const meta = chart.getDatasetMeta(di);
+                        if (meta.hidden) return;
+                        meta.data.forEach((el, i) => {{
+                            if (!ds.data[i]) return;
+                            const x = el.x;
+                            const yTop = Math.min(el.y, el.base);
+                            const yBot = Math.max(el.y, el.base);
+                            ctx.save();
+                            ctx.strokeStyle = ds.borderColor;
+                            // vertical min..max line
+                            ctx.lineWidth = 3;
+                            ctx.beginPath();
+                            ctx.moveTo(x, yTop); ctx.lineTo(x, yBot);
+                            ctx.stroke();
+                            // bracket caps at min and max
+                            ctx.lineWidth = 2;
+                            [yTop, yBot].forEach(y => {{
+                                ctx.beginPath();
+                                ctx.moveTo(x - 7, y); ctx.lineTo(x + 7, y);
+                                ctx.stroke();
+                            }});
+                            // median tick
+                            const med = ds.meds[i];
+                            if (med != null) {{
+                                const my = yS.getPixelForValue(med);
+                                ctx.lineWidth = 4;
+                                ctx.beginPath();
+                                ctx.moveTo(x - 10, my); ctx.lineTo(x + 10, my);
+                                ctx.stroke();
+                                // median value above the bracket
+                                ctx.fillStyle = '#0b0b0b';
+                                ctx.font = '600 10px system-ui, sans-serif';
+                                ctx.textAlign = 'center';
+                                ctx.fillText(Math.round(med).toLocaleString(),
+                                             x, yTop - 6);
+                            }}
+                            ctx.restore();
+                        }});
+                    }});
+                }}
+            }};
+
+            new Chart(document.getElementById('chart_tps_range'), {{
+                type: 'bar',
+                plugins: [bracketPlugin],
+                data: {{
+                    labels: phaseGroups.map(g => g.label),
+                    datasets: allocators.map(a => ({{
+                        label: a,
+                        data: phaseGroups.map(g => {{
+                            const b = tpsBar(a, g);
+                            return b ? [b.min / 60, b.max / 60] : null;
+                        }}),
+                        meds: phaseGroups.map(g => {{
+                            const b = tpsBar(a, g);
+                            return b ? b.med / 60 : null;
+                        }}),
+                        // invisible bars keep the per-allocator slot offsets
+                        // and the hover hit area; the plugin draws the marks
+                        backgroundColor: 'rgba(0,0,0,0)',
+                        borderColor: allocColor(a),
+                        maxBarThickness: 40,
+                        categoryPercentage: 0.85,
+                        barPercentage: 0.9,
+                    }})),
+                }},
+                options: {{
+                    animation: false, responsive: true, maintainAspectRatio: false,
+                    layout: {{ padding: {{ top: 20 }} }},
+                    plugins: {{
+                        legend: {{ display: true }},
+                        tooltip: {{ callbacks: {{
+                            label: c2 => {{
+                                const b = tpsBar(c2.dataset.label,
+                                                 phaseGroups[c2.dataIndex]);
+                                if (!b) return '';
+                                return c2.dataset.label + ': median ' +
+                                    Math.round(b.med / 60).toLocaleString() +
+                                    ' TPS (' + Math.round(b.min / 60).toLocaleString() +
+                                    ' .. ' + Math.round(b.max / 60).toLocaleString() + ')';
+                            }}
+                        }} }},
+                    }},
+                    scales: {{
+                        y: {{ beginAtZero: false, grace: '15%',
+                              title: {{ display: true, text: 'TPS (min..median..max)' }},
+                              grid: {{ color: '#e1e0d9' }} }}
+                    }}
+                }}
+            }});
+
+            let slowest = Infinity;
+            phaseGroups.forEach(g => allocators.forEach(a => {{
+                const b = tpsBar(a, g);
+                if (b) slowest = Math.min(slowest, b.med);
+            }}));
+            new Chart(document.getElementById('chart_tps_delta'), {{
+                type: 'bar',
+                data: {{
+                    labels: phaseGroups.map(g => g.label),
+                    datasets: allocators.map(a => ({{
+                        label: a,
+                        data: phaseGroups.map(g => {{
+                            const b = tpsBar(a, g);
+                            return b ? (b.med / slowest - 1) * 100 : null;
+                        }}),
+                        backgroundColor: allocColor(a),
+                        borderRadius: 4,
+                        maxBarThickness: 40,
+                    }})),
+                }},
+                options: {{
+                    animation: false, responsive: true, maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{ display: true }},
+                        tooltip: {{ callbacks: {{
+                            label: c2 => {{
+                                const b = tpsBar(c2.dataset.label,
+                                                 phaseGroups[c2.dataIndex]);
+                                if (!b) return '';
+                                return c2.dataset.label + ': +' +
+                                    c2.parsed.y.toFixed(2) + '% (' +
+                                    Math.round(b.med / 60).toLocaleString() + ' TPS)';
+                            }}
+                        }} }},
+                    }},
+                    scales: {{
+                        y: {{ beginAtZero: true,
+                              title: {{ display: true, text: '% above slowest' }},
+                              grid: {{ color: '#e1e0d9' }} }}
+                    }}
+                }}
+            }});
+        }}
+
         // Grouped bars: x = allocator, series = thp mode
-        const allocators = [...new Set(combos.map(c => c.allocator))];
-        const thpModes = [...new Set(combos.map(c => c.thp))].sort();
         const thpBarColors = {{'thp': '#2a78d6', 'nothp': '#86b6ef'}};
 
         barMeta.forEach(meta => {{
@@ -564,6 +768,8 @@ def main():
         description='Generate HTML report from allocator perf suite results.')
     parser.add_argument('suite_dir', nargs='?', default='suite-allocperf1')
     parser.add_argument('output_file', nargs='?', default='suite_report.html')
+    parser.add_argument('--verdict', default=None,
+                        help='HTML fragment file injected as a Verdict section')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -580,25 +786,32 @@ def main():
 
     parsed = []
     for run in runs:
-        label = f"{run['thp']}-{run['allocator']}-rep{run['rep']}"
-        print(f'Parsing {label}...', flush=True)
-        r = parse_run(run)
-        if r is None:
-            print('  incomplete run, skipped')
+        prefix = f"{run['thp']}_{run['allocator']}"
+        dts = run_timestamps(run['dir'], prefix)
+        if not dts:
+            print(f"No run instances in {run['dir']}, skipped")
             continue
-        st = r['nopm']['steady'][1]
-        rg = r['nopm']['regrow'][1]
-        print(f"  steady TPM={st}, regrow TPM={rg}, "
-              f"released={round((r['released_kb'] or 0)/1024)} MB, "
-              f"ratchet={round((r['ratchet_kb'] or 0)/1024)} MB, "
-              f"maxTHP={round(r['max_ahp_kb']/1024/1024, 2)} GB")
-        parsed.append(r)
+        for dt in dts:
+            label = f"{run['thp']}-{run['allocator']}-rep{run['rep']} [{dt}]"
+            print(f'Parsing {label}...', flush=True)
+            r = parse_run(run, dt)
+            if r is None:
+                print('  incomplete run, skipped')
+                continue
+            st = r['nopm']['steady'][1]
+            rg = r['nopm']['regrow'][1]
+            print(f"  steady TPM={st}, regrow TPM={rg}, "
+                  f"released={round((r['released_kb'] or 0)/1024)} MB, "
+                  f"ratchet={round((r['ratchet_kb'] or 0)/1024)} MB, "
+                  f"maxTHP={round(r['max_ahp_kb']/1024/1024, 2)} GB")
+            parsed.append(r)
 
     if not parsed:
         print('No usable runs.')
         sys.exit(1)
 
-    build_report(parsed, output_file, os.path.basename(suite_dir))
+    build_report(parsed, output_file, os.path.basename(suite_dir),
+                 load_verdict(args.verdict))
     print(f'\nReport generated: {output_file}')
 
 

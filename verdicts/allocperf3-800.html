@@ -1,0 +1,22 @@
+<p><strong>Setup:</strong> 800 warehouses (~80&nbsp;GB) against a 48&nbsp;GB buffer pool &mdash;
+the dataset exceeds the pool by ~1.7&times;, so the workload is partially I/O-bound (~9.7k TPS vs
+~11.1k for the same configurations fully cached). HammerDB TPC-C plus malloc-stress clients;
+phases steady&nbsp;&rarr;&nbsp;idle&nbsp;&rarr;&nbsp;regrow; 3 repetitions. THP engaged partially
+(28&ndash;32&nbsp;GB AnonHugePages in thp runs).</p>
+<ul>
+<li><strong>Throughput is a statistical tie:</strong> the full spread from slowest to fastest
+configuration is 0.78&nbsp;%, with rep noise of 0.2&ndash;0.6&nbsp;%. Under I/O wait the
+allocator&rsquo;s CPU cost compresses to near-invisibility. The THP gain also collapses to
++0.2&ndash;0.7&nbsp;% (vs ~+2&nbsp;% when cached).</li>
+<li><strong>Memory still differentiates clearly:</strong> glibc again shows ~2.5&nbsp;GB untracked
+overhead (vs 1.7&ndash;1.9&nbsp;GB for the rest) and a ~600&ndash;700&nbsp;MB/cycle plateau ratchet
+&mdash; an order of magnitude above jemalloc&nbsp;3.6 (59&nbsp;MB). jemalloc&nbsp;5.3 with THP shows
+its known idle-phase growth (~510&nbsp;MB). tcmalloc has the steadiest profile.</li>
+<li><strong>Methodological lesson:</strong> letting the dataset exceed the buffer pool dilutes the
+throughput signal this suite exists to measure &mdash; page I/O adds noise and no malloc traffic.
+For allocator comparisons keep the dataset cached; test I/O pressure as a separate question.</li>
+</ul>
+<p><strong>Bottom line:</strong> in I/O-mixed conditions allocator choice does not measurably move
+throughput; the decision rests on memory behavior, where tcmalloc (most stable) and
+jemalloc&nbsp;3.6 (leanest) win and glibc&rsquo;s compounding growth again makes it the one to
+avoid. (Caveat: thp and nothp halves ran concurrently on separate hosts.)</p>

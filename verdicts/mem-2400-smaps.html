@@ -1,0 +1,19 @@
+<p><strong>Setup:</strong> 20-hour HammerDB TPC-C runs at ~2400&nbsp;MHz with a 150&nbsp;GB buffer
+pool, /proc/pid/smaps sampled every 30 seconds (~700 snapshots per run).</p>
+<ul>
+<li><strong>Physical residency is essentially a tie:</strong> average RSS spans just a 0.4&nbsp;GB
+band (jemallocs 162.93&nbsp;GB, glibc 163.26, tcmalloc 163.33 &mdash; a 0.25&nbsp;% spread). With
+~92&nbsp;% of RSS being the buffer pool, the allocators barely differ on resident memory at this
+workload; their differences live in virtual address space (see the maps report).</li>
+<li><strong>RSS is flat:</strong> growth over 20 hours is &minus;0.04 to +0.06&nbsp;GB in every run
+&mdash; no leak or creep. Swap stayed at 0; file-backed RSS is negligible (~23&nbsp;MB); the
+referenced working set hovers around 159&nbsp;GB (nearly the whole pool stays hot).</li>
+<li><strong>THP never materialized:</strong> AnonHugePages is 0 in all 8 runs, including the
+&ldquo;thp&rdquo; ones &mdash; the kernel was in <code>madvise</code> mode and nothing called
+MADV_HUGEPAGE, so the thp/nothp comparison in this dataset measures noise. (The suite harness was
+subsequently fixed to set THP via sysfs and abort if huge pages do not engage.)</li>
+</ul>
+<p><strong>Bottom line:</strong> a 150&nbsp;GB buffer pool dominates residency so completely that
+allocator choice is invisible in RSS here; this dataset established that none of the allocators
+leaks, and that a valid THP comparison required fixing the harness &mdash; both addressed in the
+later allocator perf suites.</p>

@@ -1,0 +1,29 @@
+<p><strong>Setup:</strong> 400 warehouses (~40&nbsp;GB, fully cached in the 48&nbsp;GB buffer pool),
+HammerDB TPC-C (80 VUs) plus sysbench malloc-stress scripts (complex queries with randomized
+sort/join/temp buffers, prepared-statement churn, connect/disconnect cycling, internal-allocation
+stress); phases steady&nbsp;&rarr;&nbsp;idle&nbsp;&rarr;&nbsp;regrow; 3&ndash;6 repetitions per configuration;
+THP engagement verified in-run (51&ndash;52&nbsp;GB AnonHugePages in thp runs).</p>
+<ul>
+<li><strong>tcmalloc is the fastest in both THP modes</strong> (11,102 TPS steady with THP; rep range
+11,101..11,103). Its lead over the other allocators is ~0.4&nbsp;% &mdash; small, but outside the
+&plusmn;0.1&ndash;0.3&nbsp;% rep noise.</li>
+<li><strong>THP <code>always</code> is worth +1.6&ndash;1.8&nbsp;%</strong> for every allocator.
+(Caveat: the thp and nothp halves ran concurrently on separate hosts, so the THP percentages carry
+a host variable; allocator rankings within each mode do not.)</li>
+<li><strong>The sysbench complex-query axis does not separate allocators</strong> (&le;1.3&nbsp;%,
+within noise); THP helps it by +2&ndash;4&nbsp;%.</li>
+<li><strong>Memory reproduces the series-wide signature:</strong> glibc carries ~700&nbsp;MB more
+untracked overhead than the field and a ~450&nbsp;MB/cycle plateau ratchet; jemalloc&nbsp;3.6 is the
+leanest (1.68&nbsp;GB overhead, near-zero ratchet); jemalloc&nbsp;5.3 is clean without THP but its
+overhead inflates to ~2.5&nbsp;GB with it; tcmalloc is mode-invariant and near-ratchet-free
+(&le;54&nbsp;MB). With connection-churning stress, every allocator (including glibc) now releases
+some memory at idle.</li>
+</ul>
+<p><strong>Series verdict (four datasets: 150G-pool steady, 400wh bash-stress, 800wh I/O-mixed,
+400wh sysbench-stress):</strong> the ranking is stable &mdash; <strong>tcmalloc</strong> for best
+throughput and the most predictable memory in every shape tested; <strong>jemalloc&nbsp;3.6</strong>
+for minimum RSS at a ~0.3&ndash;2&nbsp;% throughput cost; <strong>jemalloc&nbsp;5.3</strong> fine
+without THP but pays a visible memory penalty with it; <strong>glibc malloc</strong>
+throughput-competitive but structurally the worst memory citizen (highest overhead, compounding
+plateau growth) &mdash; avoid it for long-running instances with variable load. THP
+<code>always</code> is consistently +1.5&ndash;2&nbsp;% when the working set is cached.</p>

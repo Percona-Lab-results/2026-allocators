@@ -1,0 +1,34 @@
+<p><strong>Setup:</strong> MyRocks (RocksDB block cache 48&nbsp;GB), 400 warehouses, HammerDB TPC-C
+(80 VUs) plus bash malloc-stress clients; steady-only runs (10&nbsp;m rampup + 30&nbsp;m measured);
+6 run instances per configuration (3 from the initial invocation, 3+ from reruns with the fixed
+TPS-counter collector, so this report includes TPS-over-time). Notes: performance_schema does not
+instrument RocksDB&rsquo;s internals, so compare RSS directly (the &ldquo;overhead&rdquo; metric is
+not meaningful here); thp and nothp halves ran concurrently on separate hosts, so THP percentages
+carry a host variable.</p>
+<ul>
+<li><strong>Confirms the MyRocks ranking at double the sample count: jemalloc&nbsp;3.6 + THP wins
+by a wide margin</strong> &mdash; 8,643 TPS, +25&nbsp;% over the slowest configuration and
++13&nbsp;% over the next-best THP one. It remains the only allocator whose memory gets nearly fully
+huge-page-backed (53.5&nbsp;GB AnonHugePages vs 6.6&ndash;17&nbsp;GB; its 2&ndash;4&nbsp;MB-aligned
+chunks are khugepaged-friendly).</li>
+<li><strong>Without THP: jemalloc&nbsp;3.6 (7,715) &gt; glibc (7,558) &gt; jemalloc&nbsp;5.3 (7,077)
+&gt; tcmalloc (6,896)</strong> &mdash; the InnoDB winner is again the MyRocks loser on
+throughput.</li>
+<li><strong>RSS spreads by 23&nbsp;%:</strong> tcmalloc 49.0&nbsp;GB (leanest), jemalloc&nbsp;3.6
+50.8&ndash;52.3&nbsp;GB, glibc 56.6&nbsp;GB, jemalloc&nbsp;5.3 59.6&ndash;60.5&nbsp;GB (the largest,
+while also slow).</li>
+<li><strong>The TPS timeline (new in this dataset) shows the gap is still widening at the 40-minute
+mark:</strong> jemalloc&nbsp;5.3 <em>degrades</em> through the run (nothp: 7,677 TPS at 15&nbsp;min
+&rarr; 7,050 at 39&nbsp;min, &minus;8&nbsp;% &mdash; consistent with progressive fragmentation of
+RocksDB&rsquo;s allocation pattern), while tcmalloc is still <em>improving</em> at the end (6,945
+&rarr; 7,269, +5&nbsp;%), and jemalloc&nbsp;3.6 and glibc are roughly flat. The 30-minute window
+therefore flatters jemalloc&nbsp;5.3 and slightly undersells tcmalloc &mdash; longer runs would
+likely widen 5.3&rsquo;s deficit and narrow tcmalloc&rsquo;s.</li>
+</ul>
+<p><strong>Bottom line:</strong> for MyRocks run <strong>jemalloc&nbsp;3.6 with THP
+<code>always</code></strong> &mdash; fastest by a wide margin, mid-pack RSS, flat over time.
+jemalloc&nbsp;5.3 is the worst choice here (slow, 23&nbsp;% more RSS than tcmalloc, and still
+degrading when the run ends); tcmalloc trades throughput for the smallest footprint; glibc is
+mediocre and barely benefits from THP. Recommended follow-ups: 60&ndash;90&nbsp;minute steady runs
+to capture the post-30-minute trends, and jemalloc&nbsp;5.3 with <code>opt.thp</code>/2&nbsp;MB
+extent alignment to test whether it can recover the 3.6 behavior.</p>

@@ -30,8 +30,16 @@
 #       [--warehouses=400] [--skip-init=yes|no] [--snapshot=yes|no] \
 #       [--engine=innodb|myrocks] \
 #       [--vu=80] [--stress-clients=8] [--stress-engine=bash|sysbench] \
+#       [--workload=hammerdb|sysbench] \
 #       [--steady-minutes=60] [--idle-minutes=30] [--regrow-minutes=60] \
 #       [--rampup-minutes=10] [--max-freq=2400]
+#
+# --workload=sysbench runs the loaded phases with ONLY the sysbench stress
+# scripts (no HammerDB TPC-C; implies --stress-engine=sysbench). Each loaded
+# phase lasts rampup+duration minutes, matching the hammerdb mode wall-clock.
+# There is no NOPM in this mode; throughput comes from the TPM-over-time
+# counters and the sysbench logs. The TPC-C schema is still required for
+# alloc_query.lua (build once with --skip-init=no).
 #
 # --idle-minutes=0 / --regrow-minutes=0 skip those phases, e.g. a plain
 # warmup+run benchmark: --rampup-minutes=10 --steady-minutes=30 \
@@ -87,6 +95,7 @@ STRESS_CLIENTS=8
 STRESS_ENGINE="bash"
 SYSBENCH_BIN="sysbench"
 STORAGE_ENGINE="innodb"
+WORKLOAD="hammerdb"
 STEADY_MINUTES=60
 IDLE_MINUTES=30
 REGROW_MINUTES=60
@@ -121,6 +130,7 @@ for arg in "$@"; do
         --stress-clients=*)  STRESS_CLIENTS="${arg#*=}" ;;
         --stress-engine=*)   STRESS_ENGINE="${arg#*=}" ;;
         --engine=*)          STORAGE_ENGINE="${arg#*=}" ;;
+        --workload=*)        WORKLOAD="${arg#*=}" ;;
         --steady-minutes=*)  STEADY_MINUTES="${arg#*=}" ;;
         --idle-minutes=*)    IDLE_MINUTES="${arg#*=}" ;;
         --regrow-minutes=*)  REGROW_MINUTES="${arg#*=}" ;;
@@ -157,6 +167,14 @@ fi
 if [[ ! "${STRESS_ENGINE}" =~ ^(bash|sysbench)$ ]]; then
     log_error "--stress-engine must be bash or sysbench, got: ${STRESS_ENGINE}"
     exit 1
+fi
+if [[ ! "${WORKLOAD}" =~ ^(hammerdb|sysbench)$ ]]; then
+    log_error "--workload must be hammerdb or sysbench, got: ${WORKLOAD}"
+    exit 1
+fi
+if [ "${WORKLOAD}" = "sysbench" ] && [ "${STRESS_ENGINE}" = "bash" ]; then
+    log_warn "--workload=sysbench implies --stress-engine=sysbench; switching"
+    STRESS_ENGINE="sysbench"
 fi
 if [[ ! "${STORAGE_ENGINE}" =~ ^(innodb|myrocks)$ ]]; then
     log_error "--engine must be innodb or myrocks, got: ${STORAGE_ENGINE}"
@@ -722,6 +740,14 @@ EOF
     HAMMERDB_PID=$!
 }
 
+# Sleep until a loaded phase reaches its full duration (sysbench-only mode)
+wait_phase_end() {
+    local total_min=$1 start_epoch=$2
+    local remaining=$(( total_min * 60 - ($(date +%s) - start_epoch) ))
+    [ "${remaining}" -gt 0 ] && sleep "${remaining}"
+    return 0
+}
+
 # For --thp=yes: verify huge pages actually materialized once under load
 check_thp_effective() {
     local pid=$1
@@ -772,6 +798,7 @@ run_one() {
         echo "vu=${VIRTUAL_USERS}"
         echo "stress_clients=${STRESS_CLIENTS}"
         echo "stress_engine=${STRESS_ENGINE}"
+        echo "workload=${WORKLOAD}"
         echo "phases=steady:${STEADY_MINUTES}m,idle:${IDLE_MINUTES}m,regrow:${REGROW_MINUTES}m"
         echo "rampup=${RAMPUP_MINUTES}m"
         grep 'LD_PRELOAD\|libjemalloc\|libtcmalloc' "/proc/${MYSQLD_PID}/maps" 2>/dev/null | head -2
@@ -784,10 +811,16 @@ run_one() {
     local phase_start phase_end
 
     # --- Phase 1: steady ---------------------------------------------------
+    local phase_start_epoch
     phase_start=$(date +"%Y-%m-%d %H:%M:%S")
-    run_hammerdb_phase "steady" "${STEADY_MINUTES}" "${RAMPUP_MINUTES}" \
-        "${results_dir}/${prefix}_hammerdb_steady_${dt}.log"
-    sleep 30
+    phase_start_epoch=$(date +%s)
+    if [ "${WORKLOAD}" = "hammerdb" ]; then
+        run_hammerdb_phase "steady" "${STEADY_MINUTES}" "${RAMPUP_MINUTES}" \
+            "${results_dir}/${prefix}_hammerdb_steady_${dt}.log"
+        sleep 30
+    else
+        log_info "Phase 'steady': sysbench-only load for $((RAMPUP_MINUTES + STEADY_MINUTES)) minutes"
+    fi
     start_stress_clients "${results_dir}/${prefix}_stress_steady_${dt}"
 
     # THP must be observable a few minutes into load
@@ -796,8 +829,13 @@ run_one() {
         check_thp_effective ${MYSQLD_PID} || { rm -f "${run_flag}"; cleanup_run; return 1; }
     fi
 
-    wait ${HAMMERDB_PID} 2>/dev/null
-    HAMMERDB_PID=""
+    if [ "${WORKLOAD}" = "hammerdb" ]; then
+        wait ${HAMMERDB_PID} 2>/dev/null
+        HAMMERDB_PID=""
+    else
+        # Same wall-clock as a hammerdb phase: rampup + duration
+        wait_phase_end $((RAMPUP_MINUTES + STEADY_MINUTES)) "${phase_start_epoch}"
+    fi
     stop_stress_clients
     phase_end=$(date +"%Y-%m-%d %H:%M:%S")
     echo "steady,${phase_start},${phase_end}" >> "${phases_csv}"
@@ -818,12 +856,21 @@ run_one() {
     # --- Phase 3: regrow (fragmentation ratchet; skipped when 0) -----------
     if [ "${REGROW_MINUTES}" -gt 0 ]; then
         phase_start=$(date +"%Y-%m-%d %H:%M:%S")
-        run_hammerdb_phase "regrow" "${REGROW_MINUTES}" "${RAMPUP_MINUTES}" \
-            "${results_dir}/${prefix}_hammerdb_regrow_${dt}.log"
-        sleep 30
+        phase_start_epoch=$(date +%s)
+        if [ "${WORKLOAD}" = "hammerdb" ]; then
+            run_hammerdb_phase "regrow" "${REGROW_MINUTES}" "${RAMPUP_MINUTES}" \
+                "${results_dir}/${prefix}_hammerdb_regrow_${dt}.log"
+            sleep 30
+        else
+            log_info "Phase 'regrow': sysbench-only load for $((RAMPUP_MINUTES + REGROW_MINUTES)) minutes"
+        fi
         start_stress_clients "${results_dir}/${prefix}_stress_regrow_${dt}"
-        wait ${HAMMERDB_PID} 2>/dev/null
-        HAMMERDB_PID=""
+        if [ "${WORKLOAD}" = "hammerdb" ]; then
+            wait ${HAMMERDB_PID} 2>/dev/null
+            HAMMERDB_PID=""
+        else
+            wait_phase_end $((RAMPUP_MINUTES + REGROW_MINUTES)) "${phase_start_epoch}"
+        fi
         stop_stress_clients
         phase_end=$(date +"%Y-%m-%d %H:%M:%S")
         echo "regrow,${phase_start},${phase_end}" >> "${phases_csv}"
@@ -903,7 +950,7 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Suite main
 # ---------------------------------------------------------------------------
-log_info "Allocator performance suite: allocators=[${ALLOCATORS}] thp=${THP_MODE} reps=${REPS}"
+log_info "Allocator performance suite: allocators=[${ALLOCATORS}] thp=${THP_MODE} reps=${REPS} workload=${WORKLOAD}"
 log_info "Dataset: ${WAREHOUSES} warehouses (~${WAREHOUSE_DATA_GB}G), engine ${STORAGE_ENGINE}, buffer/cache ${BUFFER_POOL_SIZE_GB}G"
 log_info "Phases per run: steady ${STEADY_MINUTES}m -> idle ${IDLE_MINUTES}m -> regrow ${REGROW_MINUTES}m (+ 2x ${RAMPUP_MINUTES}m rampup)"
 log_info "Suite directory: ${SUITE_DIR}"

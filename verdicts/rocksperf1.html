@@ -1,0 +1,35 @@
+<p><strong>Setup:</strong> MyRocks (RocksDB block cache 48&nbsp;GB), 400 warehouses, HammerDB TPC-C
+(80 VUs) plus bash malloc-stress clients; steady-only runs (10&nbsp;m rampup + 30&nbsp;m measured);
+3 repetitions per configuration. Note: performance_schema does not instrument RocksDB&rsquo;s
+internal allocations (tracked bytes &asymp; 0.7&nbsp;GB), so the &ldquo;overhead&rdquo; metric is
+not meaningful here &mdash; compare RSS directly. The thp and nothp halves ran concurrently on
+separate hosts, so THP percentages carry a host variable.</p>
+<ul>
+<li><strong>Unlike InnoDB, allocator choice moves MyRocks throughput dramatically</strong> &mdash;
+the spread is 27&nbsp;% (vs &le;1&nbsp;% for InnoDB on the same hardware). RocksDB allocates its
+block cache, memtables and compaction buffers in many small-to-medium chunks through malloc, so the
+allocator sits on the hot path in a way InnoDB&rsquo;s one-big-buffer-pool design avoids.</li>
+<li><strong>jemalloc&nbsp;3.6 + THP is the standout: 8,641 TPS, +27&nbsp;% over the slowest and
++14&nbsp;% over the next-best THP configuration.</strong> It is the only allocator whose memory
+gets almost fully huge-page-backed (53.7&nbsp;GB AnonHugePages vs 6.6&ndash;17&nbsp;GB for the
+others) &mdash; its 2&ndash;4&nbsp;MB-aligned chunks are khugepaged-friendly, while the others leave
+most of the block cache on 4&nbsp;KB pages.</li>
+<li><strong>Without THP, jemalloc&nbsp;3.6 also leads</strong> (7,646 TPS), ahead of glibc (7,503),
+jemalloc&nbsp;5.3 (7,020) and tcmalloc (6,782) &mdash; <strong>tcmalloc, the InnoDB winner, is the
+slowest allocator under MyRocks</strong> (&minus;11&nbsp;% vs jemalloc&nbsp;3.6).</li>
+<li><strong>RSS varies hugely by allocator:</strong> tcmalloc 49.0&nbsp;GB (leanest),
+jemalloc&nbsp;3.6 50.7&ndash;52.5&nbsp;GB, glibc 56.6&nbsp;GB, <strong>jemalloc&nbsp;5.3
+59.6&ndash;60.6&nbsp;GB &mdash; 23&nbsp;% more physical memory than tcmalloc for the same
+48&nbsp;GB cache</strong>, and slow on top of it.</li>
+<li><strong>THP helps every allocator here</strong> (+0.7&nbsp;% glibc, +8&nbsp;% jemalloc&nbsp;5.3,
++11&nbsp;% tcmalloc, +13&nbsp;% jemalloc&nbsp;3.6), roughly in proportion to how much memory
+actually gets huge-page-backed.</li>
+</ul>
+<p><strong>Bottom line:</strong> for MyRocks the allocator decision is first-order, and it inverts
+the InnoDB ranking: <strong>jemalloc&nbsp;3.6 with THP <code>always</code></strong> is the clear
+winner (fastest by a wide margin, mid-pack RSS), validating Percona&rsquo;s jemalloc guidance for
+MyRocks; tcmalloc trades 11&ndash;13&nbsp;% throughput for the smallest footprint; jemalloc&nbsp;5.3
+is the worst of both worlds here (slowest-but-one and the largest RSS); glibc is mediocre
+throughout and barely benefits from THP. Worth a follow-up: jemalloc&nbsp;5.3 with
+<code>opt.thp/metadata_thp</code> or 2&nbsp;MB-aligned extent tuning to see if it can recover the
+3.6 behavior.</p>

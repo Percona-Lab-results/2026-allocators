@@ -1,0 +1,26 @@
+<p><strong>Setup:</strong> 400 warehouses (~40&nbsp;GB, fully cached in the 48&nbsp;GB buffer pool),
+HammerDB TPC-C (80 VUs) plus bash malloc-stress clients (big sorts, GROUP_CONCAT, prepared-statement
+churn, connection cycling); phases steady&nbsp;&rarr;&nbsp;idle&nbsp;&rarr;&nbsp;regrow; 3 repetitions
+per configuration. Runs are CPU-bound (~11k TPS vs ~6.3k when the dataset exceeded the pool) and the
+rep noise floor is 0.1&ndash;0.7&nbsp;%, so sub-1&nbsp;% differences are resolvable. THP engaged fully
+(51&ndash;53&nbsp;GB AnonHugePages in thp runs).</p>
+<ul>
+<li><strong>tcmalloc leads TPM without THP</strong> (+0.7&nbsp;% over glibc, +1.0&nbsp;% over the
+jemallocs &mdash; above noise). <strong>Under THP the field is a near-tie</strong> (tcmalloc &asymp;
+jemalloc&nbsp;5.3 &asymp; glibc within 0.1&nbsp;%): huge pages level the TLB-miss component that
+allocator layout otherwise influences.</li>
+<li><strong>THP <code>always</code> is worth +1.4&ndash;2.2&nbsp;%</strong> for every allocator
+(caveat: thp and nothp halves ran concurrently on separate hosts).</li>
+<li><strong>glibc is the memory outlier:</strong> highest RSS and ~500&ndash;800&nbsp;MB more
+untracked overhead (RSS minus performance_schema tracked bytes) than the rest.</li>
+<li><strong>The jemallocs shrink across the idle/regrow cycle without THP</strong> (ratchet
+&minus;25/&minus;27&nbsp;MB) &mdash; the cleanest release-to-OS behavior; under THP both pick up
+idle-phase growth (+360&ndash;560&nbsp;MB), consistent with khugepaged collapsing sparse regions
+into fully-resident huge pages. tcmalloc is unaffected either way.</li>
+<li><strong>Regrow TPM is uniformly ~2.5&ndash;2.8&nbsp;% below steady</strong> in every
+configuration &mdash; dataset growth plus purge backlog make the second loaded phase inherently
+slower; it does not affect the ranking.</li>
+</ul>
+<p><strong>Bottom line:</strong> tcmalloc if throughput is the priority (edge is real but ~1&nbsp;%,
+and disappears under THP); jemalloc for the leanest, best-behaved memory; glibc consistently the
+worst memory citizen despite competitive throughput.</p>

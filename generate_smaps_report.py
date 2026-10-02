@@ -224,7 +224,20 @@ CHARTS = [
 ]
 
 
-def generate_html_report(results, output_file, data_dir):
+def load_verdict(path):
+    """Wrap a verdict HTML fragment for injection into the report."""
+    if not path:
+        return ''
+    with open(path) as f:
+        content = f.read()
+    return ('<div class="verdict" style="background-color:#f0f7ee;'
+            'border-left:4px solid #0ca30c;padding:15px 20px;margin:20px 0;'
+            'font-size:14px;line-height:1.5;">\n'
+            '<h2 style="margin-top:0;">Verdict</h2>\n'
+            + content + '\n</div>')
+
+
+def generate_html_report(results, output_file, data_dir, verdict_html=''):
     """
     results: {dir_name: (config, points, stats)}
     """
@@ -350,6 +363,8 @@ def generate_html_report(results, output_file, data_dir):
             Solid lines = THP enabled, dashed lines = THP disabled; color = allocator.
             Drag on a chart to zoom.
         </div>
+
+{verdict_html}
 
         <div class="controls">
             <h3>Configurations</h3>
@@ -526,6 +541,8 @@ def main():
                              '(default: mem-2400)')
     parser.add_argument('output_file', nargs='?', default='smaps_report.html',
                         help='Output HTML file (default: smaps_report.html)')
+    parser.add_argument('--verdict', default=None,
+                        help='HTML fragment file injected as a Verdict section')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -567,7 +584,8 @@ def main():
         print("No data parsed; report not generated.")
         sys.exit(1)
 
-    generate_html_report(results, output_file, os.path.basename(data_dir))
+    generate_html_report(results, output_file, os.path.basename(data_dir),
+                         load_verdict(args.verdict))
     print(f"\nReport generated: {output_file}")
     print(f"Open in browser: file://{output_file}")
 
